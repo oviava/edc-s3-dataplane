@@ -13,7 +13,12 @@ def build_dataflow_service(settings: Settings) -> DataFlowService:
     return DataFlowService(
         dataplane_id=settings.dataplane_id,
         repository=InMemoryDataFlowRepository(),
-        transfer_executor=S3TransferExecutor(),
+        transfer_executor=S3TransferExecutor(
+            default_region=settings.aws_region,
+            multipart_threshold_mb=settings.s3_multipart_threshold_mb,
+            multipart_part_size_mb=settings.s3_multipart_part_size_mb,
+            multipart_concurrency=settings.s3_multipart_concurrency,
+        ),
         control_plane_notifier=NoopControlPlaneNotifier(),
     )
 

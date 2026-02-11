@@ -95,18 +95,37 @@ class DataFlowService:
 
         ensure_s3_transfer_type(message.transfer_type)
         transfer_mode = parse_transfer_mode(message.transfer_type)
-        self._validate_start_data_address(transfer_mode, message.data_address)
 
-        data_flow = await self._repository.get_by_process_id(message.process_id)
-        if data_flow is None:
+        existing = await self._repository.get_by_process_id(message.process_id)
+        if existing is None:
             data_flow = self._new_data_flow(message, transfer_mode)
-        elif data_flow.state in TERMINAL_STATES:
+        elif existing.state in TERMINAL_STATES:
             raise DataFlowConflictError(
-                f"Cannot start data flow '{data_flow.data_flow_id}' in state '{data_flow.state}'."
+                f"Cannot start data flow '{existing.data_flow_id}' in state '{existing.state}'."
+            )
+        else:
+            data_flow = existing
+
+        if existing is not None and existing.transfer_mode is not transfer_mode:
+            raise DataFlowConflictError(
+                "Incoming transferType is incompatible with existing flow mode "
+                f"for processId '{message.process_id}'."
             )
 
-        if message.data_address is not None:
-            data_flow.data_address = message.data_address
+        effective_data_address = message.data_address
+        if (
+            transfer_mode is TransferMode.PUSH
+            and effective_data_address is None
+            and existing is not None
+            and existing.data_address is not None
+        ):
+            # Resume on start can reuse the established push destination.
+            effective_data_address = existing.data_address
+
+        self._validate_start_data_address(transfer_mode, effective_data_address)
+
+        if effective_data_address is not None:
+            data_flow.data_address = effective_data_address
 
         if self._is_async_requested(message.metadata, "Start"):
             data_flow.state = DataFlowState.STARTING
@@ -135,12 +154,23 @@ class DataFlowService:
         """Handle `/dataflows/{id}/started` for consumer-side transitions."""
 
         data_flow = await self._get_data_flow_or_raise(data_flow_id)
-        self._validate_started_notification(data_flow.transfer_mode, message)
+        effective_message = message
+        if (
+            data_flow.transfer_mode is TransferMode.PULL
+            and (effective_message is None or effective_message.data_address is None)
+            and data_flow.data_address is not None
+        ):
+            # Resume can omit the source address if it was already persisted.
+            effective_message = DataFlowStartedNotificationMessage(
+                data_address=data_flow.data_address
+            )
 
-        if message is not None and message.data_address is not None:
-            data_flow.data_address = message.data_address
+        self._validate_started_notification(data_flow.transfer_mode, effective_message)
 
-        await self._transfer_executor.notify_started(data_flow, message)
+        if effective_message is not None and effective_message.data_address is not None:
+            data_flow.data_address = effective_message.data_address
+
+        await self._transfer_executor.notify_started(data_flow, effective_message)
         data_flow.state = DataFlowState.STARTED
         await self._repository.upsert(data_flow)
 

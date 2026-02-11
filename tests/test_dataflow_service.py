@@ -6,7 +6,9 @@ import pytest
 
 from simpl_bulk_dataplane.application.services import DataFlowService
 from simpl_bulk_dataplane.domain.errors import DataFlowValidationError
+from simpl_bulk_dataplane.domain.ports import TransferExecutor
 from simpl_bulk_dataplane.domain.signaling_models import (
+    DataAddress,
     DataFlowPrepareMessage,
     DataFlowStartMessage,
 )
@@ -85,3 +87,81 @@ def test_start_push_requires_data_address(service: DataFlowService) -> None:
 
     with pytest.raises(DataFlowValidationError):
         asyncio.run(service.start(message))
+
+
+class RecordingTransferExecutor(TransferExecutor):
+    """Test double that avoids real S3 calls for service behavior checks."""
+
+    async def prepare(self, *_: object, **__: object) -> DataAddress | None:
+        return None
+
+    async def start(self, *_: object, **__: object) -> DataAddress | None:
+        return None
+
+    async def notify_started(
+        self,
+        *_: object,
+        **__: object,
+    ) -> None:
+        return None
+
+    async def suspend(self, *_: object, **__: object) -> None:
+        return None
+
+    async def terminate(self, *_: object, **__: object) -> None:
+        return None
+
+    async def complete(self, *_: object, **__: object) -> None:
+        return None
+
+
+def test_start_can_resume_push_without_repeating_data_address() -> None:
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=RecordingTransferExecutor(),
+        control_plane_notifier=NoopControlPlaneNotifier(),
+    )
+
+    initial = DataFlowStartMessage(
+        message_id="msg-3",
+        participant_id="did:web:provider",
+        counter_party_id="did:web:consumer",
+        dataspace_context="context-1",
+        process_id="proc-resume-push",
+        agreement_id="agreement-1",
+        dataset_id="dataset-1",
+        callback_address="https://example.com/callback",
+        transfer_type="com.test.s3-PUSH",
+        data_address=DataAddress(
+            type_="DataAddress",
+            endpoint_type="urn:aws:s3",
+            endpoint="s3://dst-bucket/result.csv",
+            endpoint_properties=[],
+        ),
+        metadata={"sourceBucket": "src-bucket", "sourceKey": "in.csv"},
+    )
+
+    first_result = asyncio.run(service.start(initial))
+    assert first_result.body is not None
+    flow_id = first_result.body.data_flow_id
+
+    asyncio.run(service.suspend(flow_id, "maintenance"))
+
+    resume = DataFlowStartMessage(
+        message_id="msg-4",
+        participant_id="did:web:provider",
+        counter_party_id="did:web:consumer",
+        dataspace_context="context-1",
+        process_id="proc-resume-push",
+        agreement_id="agreement-1",
+        dataset_id="dataset-1",
+        callback_address="https://example.com/callback",
+        transfer_type="com.test.s3-PUSH",
+        metadata={"sourceBucket": "src-bucket", "sourceKey": "in.csv"},
+    )
+
+    resumed_result = asyncio.run(service.start(resume))
+    assert resumed_result.status_code == 200
+    assert resumed_result.body is not None
+    assert resumed_result.body.state is DataFlowState.STARTED

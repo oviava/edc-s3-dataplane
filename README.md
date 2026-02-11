@@ -33,4 +33,10 @@ pytest -q
 
 - Endpoints are scaffolded from `docs/signaling-openapi.yaml`.
 - Models mirror `docs/docs/schemas/*.json` with Pydantic aliases for DPS JSON field names.
-- Repository and transfer execution are intentionally pluggable; the current implementation is in-memory plus S3-oriented placeholders.
+- Transfer execution is async and in-memory session based:
+  - `start`/`notify_started` trigger background S3 copy tasks.
+  - `suspend` pauses execution and a subsequent `start` resumes.
+  - multipart copy is used for large objects or `forceMultipart=true`.
+- Useful metadata keys for S3 execution:
+  - `sourceBucket`, `sourceKey`, `destinationBucket`, `destinationKey`
+  - `multipartThresholdMb`, `multipartPartSizeMb`, `multipartConcurrency`
