@@ -47,4 +47,5 @@ RUN_DOCKER_E2E=1 pytest -q -m e2e tests/e2e/test_transfer_resume_e2e.py
   - `sourceBucket`, `sourceKey`, `destinationBucket`, `destinationKey`
   - `sourceDataAddress`, `destinationDataAddress` (DataAddress-shaped objects)
   - `<target>EndpointUrl`, `<target>ForcePathStyle` (`target` = `source` or `destination`)
+  - `<target>AccessKeyId`, `<target>SecretAccessKey`, `<target>SessionToken`
   - `multipartThresholdMb`, `multipartPartSizeMb`, `multipartConcurrency`

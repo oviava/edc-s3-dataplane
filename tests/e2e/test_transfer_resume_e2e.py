@@ -171,6 +171,8 @@ def _data_address(bucket: str, key: str, endpoint_url: str) -> dict[str, object]
             {"name": "region", "value": "us-east-1"},
             {"name": "endpointUrl", "value": endpoint_url},
             {"name": "forcePathStyle", "value": "true"},
+            {"name": "accessKeyId", "value": MINIO_ACCESS_KEY},
+            {"name": "secretAccessKey", "value": MINIO_SECRET_KEY},
         ],
     }
 

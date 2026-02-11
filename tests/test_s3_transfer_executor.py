@@ -6,7 +6,11 @@ import time
 from typing import Any
 
 from simpl_bulk_dataplane.domain.entities import DataFlow
-from simpl_bulk_dataplane.domain.signaling_models import DataAddress, DataFlowStartMessage
+from simpl_bulk_dataplane.domain.signaling_models import (
+    DataAddress,
+    DataFlowStartMessage,
+    EndpointProperty,
+)
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState, TransferMode
 from simpl_bulk_dataplane.infrastructure.transfers import S3TransferExecutor
 
@@ -211,3 +215,85 @@ def test_suspend_then_resume_continues_multipart_transfer() -> None:
 
     assert fake_client.complete_calls == 1
     assert sorted(fake_client.uploaded_part_numbers) == [1, 2, 3, 4]
+
+
+def test_start_uses_dataaddress_credentials_for_s3_clients() -> None:
+    fake_client = FakeS3Client({("src-bucket", "source.bin"): 1 * 1024 * 1024})
+    client_calls: list[tuple[str | None, str | None, bool, str | None, str | None, str | None]] = []
+
+    def factory(
+        region: str | None,
+        endpoint_url: str | None,
+        force_path_style: bool,
+        access_key_id: str | None,
+        secret_access_key: str | None,
+        session_token: str | None,
+    ) -> FakeS3Client:
+        client_calls.append(
+            (
+                region,
+                endpoint_url,
+                force_path_style,
+                access_key_id,
+                secret_access_key,
+                session_token,
+            )
+        )
+        return fake_client
+
+    executor = S3TransferExecutor(
+        multipart_threshold_mb=8,
+        multipart_part_size_mb=8,
+        s3_client_factory=factory,
+    )
+
+    data_flow = _build_data_flow("credentials")
+    message = _build_start_message("credentials").model_copy(
+        update={
+            "metadata": {
+                "sourceDataAddress": {
+                    "@type": "DataAddress",
+                    "endpointType": "urn:aws:s3",
+                    "endpoint": "s3://src-bucket/source.bin",
+                    "endpointProperties": [
+                        {"name": "region", "value": "us-east-1"},
+                        {"name": "endpointUrl", "value": "http://source-minio:9000"},
+                        {"name": "forcePathStyle", "value": "true"},
+                        {"name": "accessKeyId", "value": "src-ak"},
+                        {"name": "secretAccessKey", "value": "src-sk"},
+                    ],
+                }
+            },
+            "data_address": DataAddress(
+                type_="DataAddress",
+                endpoint_type="urn:aws:s3",
+                endpoint="s3://dst-bucket/result.bin",
+                endpoint_properties=[
+                    EndpointProperty(name="region", value="us-east-1"),
+                    EndpointProperty(name="endpointUrl", value="http://dest-minio:9000"),
+                    EndpointProperty(name="forcePathStyle", value="true"),
+                    EndpointProperty(name="accessKeyId", value="dst-ak"),
+                    EndpointProperty(name="secretAccessKey", value="dst-sk"),
+                ],
+            ),
+        }
+    )
+
+    async def scenario() -> None:
+        await executor.start(data_flow, message)
+        await executor.complete(data_flow)
+
+    asyncio.run(scenario())
+
+    assert len(client_calls) >= 2
+    source_call, destination_call = client_calls[0], client_calls[1]
+
+    assert source_call[1] == "http://source-minio:9000"
+    assert source_call[2] is True
+    assert source_call[3] == "src-ak"
+    assert source_call[4] == "src-sk"
+
+    assert destination_call[1] == "http://dest-minio:9000"
+    assert destination_call[2] is True
+    assert destination_call[3] == "dst-ak"
+    assert destination_call[4] == "dst-sk"

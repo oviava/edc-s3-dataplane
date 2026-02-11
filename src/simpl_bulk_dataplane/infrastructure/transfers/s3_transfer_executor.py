@@ -85,6 +85,9 @@ class S3ObjectRef:
     region: str | None = None
     endpoint_url: str | None = None
     force_path_style: bool = False
+    access_key_id: str | None = None
+    secret_access_key: str | None = None
+    session_token: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -133,7 +136,11 @@ class S3TransferExecutor(TransferExecutor):
         multipart_threshold_mb: int = _DEFAULT_MULTIPART_THRESHOLD_MB,
         multipart_part_size_mb: int = _DEFAULT_MULTIPART_PART_SIZE_MB,
         multipart_concurrency: int = _DEFAULT_MULTIPART_CONCURRENCY,
-        s3_client_factory: Callable[[str | None, str | None, bool], S3Client] | None = None,
+        s3_client_factory: Callable[
+            [str | None, str | None, bool, str | None, str | None, str | None],
+            S3Client,
+        ]
+        | None = None,
     ) -> None:
         self._default_region = default_region
         threshold_mb = max(_MIN_MULTIPART_SIZE_MB, multipart_threshold_mb)
@@ -295,11 +302,17 @@ class S3TransferExecutor(TransferExecutor):
             session.plan.source.region or self._default_region,
             session.plan.source.endpoint_url,
             session.plan.source.force_path_style,
+            session.plan.source.access_key_id,
+            session.plan.source.secret_access_key,
+            session.plan.source.session_token,
         )
         destination_client = self._s3_client_factory(
             session.plan.destination.region or self._default_region,
             session.plan.destination.endpoint_url,
             session.plan.destination.force_path_style,
+            session.plan.destination.access_key_id,
+            session.plan.destination.secret_access_key,
+            session.plan.destination.session_token,
         )
 
         size = await self._get_source_size(source_client, session.plan.source)
@@ -496,6 +509,9 @@ class S3TransferExecutor(TransferExecutor):
             session.plan.destination.region or self._default_region,
             session.plan.destination.endpoint_url,
             session.plan.destination.force_path_style,
+            session.plan.destination.access_key_id,
+            session.plan.destination.secret_access_key,
+            session.plan.destination.session_token,
         )
         with suppress(Exception):
             await asyncio.to_thread(
@@ -574,12 +590,24 @@ class S3TransferExecutor(TransferExecutor):
                 f"Missing {target} bucket/key metadata for S3 transfer execution."
             )
 
+        access_key_id = self._pick_access_key_id(metadata, target)
+        secret_access_key = self._pick_secret_access_key(metadata, target)
+        session_token = self._pick_session_token(metadata, target)
+        self._validate_static_credentials(
+            access_key_id,
+            secret_access_key,
+            source=f"metadata[{target}]",
+        )
+
         return S3ObjectRef(
             bucket=bucket,
             key=key,
             region=self._pick_region(metadata, target),
             endpoint_url=self._pick_endpoint_url(metadata, target),
             force_path_style=self._pick_force_path_style(metadata, target),
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=session_token,
         )
 
     def _parse_data_address(self, data_address: DataAddress) -> S3ObjectRef:
@@ -612,12 +640,19 @@ class S3TransferExecutor(TransferExecutor):
                 f"Invalid S3 endpoint '{endpoint}', expected s3://bucket/key."
             )
 
+        access_key_id, secret_access_key, session_token = self._credentials_from_address(
+            data_address
+        )
+
         return S3ObjectRef(
             bucket=bucket,
             key=key,
             region=self._region_from_address(data_address),
             endpoint_url=endpoint_url,
             force_path_style=self._force_path_style_from_address(data_address),
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=session_token,
         )
 
     def _region_from_address(self, data_address: DataAddress) -> str | None:
@@ -643,6 +678,43 @@ class S3TransferExecutor(TransferExecutor):
             if prop.name.lower() == "forcepathstyle":
                 return self._coerce_bool(prop.value)
         return False
+
+    def _credentials_from_address(
+        self,
+        data_address: DataAddress,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Extract static AWS credentials from endpoint properties when provided."""
+
+        property_map = {
+            prop.name.lower(): prop.value for prop in data_address.endpoint_properties
+        }
+        access_key_id = property_map.get("accesskeyid") or property_map.get("awsaccesskeyid")
+        secret_access_key = property_map.get("secretaccesskey") or property_map.get(
+            "awssecretaccesskey"
+        )
+        session_token = property_map.get("sessiontoken") or property_map.get("awssessiontoken")
+
+        self._validate_static_credentials(
+            access_key_id,
+            secret_access_key,
+            source="DataAddress.endpointProperties",
+        )
+        return access_key_id, secret_access_key, session_token
+
+    def _validate_static_credentials(
+        self,
+        access_key_id: str | None,
+        secret_access_key: str | None,
+        source: str,
+    ) -> None:
+        """Ensure static credentials are either fully provided or omitted."""
+
+        if (access_key_id is None) == (secret_access_key is None):
+            return
+        raise DataFlowValidationError(
+            f"{source} must include both accessKeyId and secretAccessKey when using "
+            "static credentials."
+        )
 
     def _build_data_address(self, metadata: dict[str, Any], target: str) -> DataAddress | None:
         """Construct an S3 DataAddress from metadata."""
@@ -670,6 +742,18 @@ class S3TransferExecutor(TransferExecutor):
         if self._pick_force_path_style(metadata, target):
             endpoint_properties.append(
                 EndpointProperty(name="forcePathStyle", value="true"),
+            )
+        if access_key_id := self._pick_access_key_id(metadata, target):
+            endpoint_properties.append(
+                EndpointProperty(name="accessKeyId", value=access_key_id),
+            )
+        if secret_access_key := self._pick_secret_access_key(metadata, target):
+            endpoint_properties.append(
+                EndpointProperty(name="secretAccessKey", value=secret_access_key),
+            )
+        if session_token := self._pick_session_token(metadata, target):
+            endpoint_properties.append(
+                EndpointProperty(name="sessionToken", value=session_token),
             )
 
         return DataAddress(
@@ -706,6 +790,30 @@ class S3TransferExecutor(TransferExecutor):
             if key in metadata:
                 return self._coerce_bool(metadata[key])
         return False
+
+    def _pick_access_key_id(self, metadata: dict[str, Any], target: str) -> str | None:
+        """Read best-effort access key metadata key variants."""
+
+        for key in (f"{target}AccessKeyId", "accessKeyId", "awsAccessKeyId"):
+            if key in metadata:
+                return str(metadata[key])
+        return None
+
+    def _pick_secret_access_key(self, metadata: dict[str, Any], target: str) -> str | None:
+        """Read best-effort secret key metadata key variants."""
+
+        for key in (f"{target}SecretAccessKey", "secretAccessKey", "awsSecretAccessKey"):
+            if key in metadata:
+                return str(metadata[key])
+        return None
+
+    def _pick_session_token(self, metadata: dict[str, Any], target: str) -> str | None:
+        """Read best-effort session token metadata key variants."""
+
+        for key in (f"{target}SessionToken", "sessionToken", "awsSessionToken"):
+            if key in metadata:
+                return str(metadata[key])
+        return None
 
     def _pick_data_address(
         self,
@@ -789,6 +897,9 @@ class S3TransferExecutor(TransferExecutor):
         region: str | None,
         endpoint_url: str | None,
         force_path_style: bool,
+        access_key_id: str | None,
+        secret_access_key: str | None,
+        session_token: str | None,
     ) -> S3Client:
         """Create a boto3 S3 client lazily to avoid import-time hard dependency."""
 
@@ -806,6 +917,12 @@ class S3TransferExecutor(TransferExecutor):
             client_kwargs["endpoint_url"] = endpoint_url
         if force_path_style:
             client_kwargs["config"] = Config(s3={"addressing_style": "path"})
+        if access_key_id is not None:
+            client_kwargs["aws_access_key_id"] = access_key_id
+        if secret_access_key is not None:
+            client_kwargs["aws_secret_access_key"] = secret_access_key
+        if session_token is not None:
+            client_kwargs["aws_session_token"] = session_token
 
         client = boto3.client("s3", **client_kwargs)
         return cast(S3Client, client)

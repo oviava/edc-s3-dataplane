@@ -25,9 +25,6 @@ services:
       dockerfile: Dockerfile
     environment:
       SIMPL_DP_DATAPLANE_ID: dataplane-a
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      AWS_DEFAULT_REGION: us-east-1
     ports:
       - "18081:8080"
     depends_on:
@@ -40,9 +37,6 @@ services:
       dockerfile: Dockerfile
     environment:
       SIMPL_DP_DATAPLANE_ID: dataplane-b
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      AWS_DEFAULT_REGION: us-east-1
     ports:
       - "18082:8080"
     depends_on:
