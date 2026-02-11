@@ -36,6 +36,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+markers = [
+  "e2e: end-to-end integration tests that require docker",
+]
 
 [tool.ruff]
 target-version = "py311"

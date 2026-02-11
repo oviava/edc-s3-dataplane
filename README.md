@@ -29,6 +29,12 @@ uvicorn simpl_bulk_dataplane.main:app --reload --port 8080
 pytest -q
 ```
 
+Run Docker end-to-end test (2 MinIO + 2 dataplanes, 100MB transfer, suspend/resume):
+
+```bash
+RUN_DOCKER_E2E=1 pytest -q -m e2e tests/e2e/test_transfer_resume_e2e.py
+```
+
 ## Notes
 
 - Endpoints are scaffolded from `docs/signaling-openapi.yaml`.
@@ -39,4 +45,6 @@ pytest -q
   - multipart copy is used for large objects or `forceMultipart=true`.
 - Useful metadata keys for S3 execution:
   - `sourceBucket`, `sourceKey`, `destinationBucket`, `destinationKey`
+  - `sourceDataAddress`, `destinationDataAddress` (DataAddress-shaped objects)
+  - `<target>EndpointUrl`, `<target>ForcePathStyle` (`target` = `source` or `destination`)
   - `multipartThresholdMb`, `multipartPartSizeMb`, `multipartConcurrency`

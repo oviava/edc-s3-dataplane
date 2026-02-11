@@ -92,10 +92,18 @@ def test_start_push_requires_data_address(service: DataFlowService) -> None:
 class RecordingTransferExecutor(TransferExecutor):
     """Test double that avoids real S3 calls for service behavior checks."""
 
+    def __init__(self) -> None:
+        self.start_messages: list[DataFlowStartMessage] = []
+
     async def prepare(self, *_: object, **__: object) -> DataAddress | None:
         return None
 
-    async def start(self, *_: object, **__: object) -> DataAddress | None:
+    async def start(
+        self,
+        _data_flow: object,
+        message: DataFlowStartMessage,
+    ) -> DataAddress | None:
+        self.start_messages.append(message)
         return None
 
     async def notify_started(
@@ -116,10 +124,11 @@ class RecordingTransferExecutor(TransferExecutor):
 
 
 def test_start_can_resume_push_without_repeating_data_address() -> None:
+    transfer_executor = RecordingTransferExecutor()
     service = DataFlowService(
         dataplane_id="dataplane-test",
         repository=InMemoryDataFlowRepository(),
-        transfer_executor=RecordingTransferExecutor(),
+        transfer_executor=transfer_executor,
         control_plane_notifier=NoopControlPlaneNotifier(),
     )
 
@@ -165,3 +174,6 @@ def test_start_can_resume_push_without_repeating_data_address() -> None:
     assert resumed_result.status_code == 200
     assert resumed_result.body is not None
     assert resumed_result.body.state is DataFlowState.STARTED
+    assert len(transfer_executor.start_messages) == 2
+    assert transfer_executor.start_messages[1].data_address is not None
+    assert transfer_executor.start_messages[1].data_address.endpoint == "s3://dst-bucket/result.csv"

@@ -136,7 +136,11 @@ class DataFlowService:
                 location=data_flow.status_path,
             )
 
-        started_address = await self._transfer_executor.start(data_flow, message)
+        executor_message = message
+        if effective_data_address is not message.data_address:
+            executor_message = message.model_copy(update={"data_address": effective_data_address})
+
+        started_address = await self._transfer_executor.start(data_flow, executor_message)
         if started_address is not None:
             data_flow.data_address = started_address
 

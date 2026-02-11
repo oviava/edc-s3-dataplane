@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from simpl_bulk_dataplane.domain.entities import DataFlow
 from simpl_bulk_dataplane.domain.errors import DataFlowValidationError
 from simpl_bulk_dataplane.domain.ports import TransferExecutor
@@ -34,23 +36,31 @@ class S3Client(Protocol):
     def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
         """Return object metadata."""
 
-    def copy_object(self, *, Bucket: str, Key: str, CopySource: dict[str, str]) -> dict[str, Any]:
-        """Copy an object without multipart."""
+    def get_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        Range: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch an object or byte range."""
+
+    def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> dict[str, Any]:
+        """Upload an object in a single call."""
 
     def create_multipart_upload(self, *, Bucket: str, Key: str) -> dict[str, Any]:
         """Start multipart upload."""
 
-    def upload_part_copy(
+    def upload_part(
         self,
         *,
         Bucket: str,
         Key: str,
         UploadId: str,
         PartNumber: int,
-        CopySource: dict[str, str],
-        CopySourceRange: str,
+        Body: bytes,
     ) -> dict[str, Any]:
-        """Copy one multipart segment."""
+        """Upload one multipart segment."""
 
     def complete_multipart_upload(
         self,
@@ -73,6 +83,8 @@ class S3ObjectRef:
     bucket: str
     key: str
     region: str | None = None
+    endpoint_url: str | None = None
+    force_path_style: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -121,7 +133,7 @@ class S3TransferExecutor(TransferExecutor):
         multipart_threshold_mb: int = _DEFAULT_MULTIPART_THRESHOLD_MB,
         multipart_part_size_mb: int = _DEFAULT_MULTIPART_PART_SIZE_MB,
         multipart_concurrency: int = _DEFAULT_MULTIPART_CONCURRENCY,
-        s3_client_factory: Callable[[str | None], S3Client] | None = None,
+        s3_client_factory: Callable[[str | None, str | None, bool], S3Client] | None = None,
     ) -> None:
         self._default_region = default_region
         threshold_mb = max(_MIN_MULTIPART_SIZE_MB, multipart_threshold_mb)
@@ -279,8 +291,18 @@ class S3TransferExecutor(TransferExecutor):
     async def _execute_plan(self, session: TransferSession) -> None:
         """Run copy workflow using multipart when object size requires it."""
 
-        client = self._s3_client_factory(session.plan.destination.region or self._default_region)
-        size = await self._get_source_size(client, session.plan.source)
+        source_client = self._s3_client_factory(
+            session.plan.source.region or self._default_region,
+            session.plan.source.endpoint_url,
+            session.plan.source.force_path_style,
+        )
+        destination_client = self._s3_client_factory(
+            session.plan.destination.region or self._default_region,
+            session.plan.destination.endpoint_url,
+            session.plan.destination.force_path_style,
+        )
+
+        size = await self._get_source_size(source_client, session.plan.source)
         use_multipart = (
             session.plan.force_multipart
             or size >= session.plan.multipart_threshold_bytes
@@ -288,31 +310,44 @@ class S3TransferExecutor(TransferExecutor):
         )
 
         if not use_multipart:
-            await self._copy_singlepart(client, session)
+            await self._copy_singlepart(source_client, destination_client, session)
             return
 
-        await self._copy_multipart(client, session, size)
+        await self._copy_multipart(source_client, destination_client, session, size)
 
-    async def _copy_singlepart(self, client: S3Client, session: TransferSession) -> None:
+    async def _copy_singlepart(
+        self,
+        source_client: S3Client,
+        destination_client: S3Client,
+        session: TransferSession,
+    ) -> None:
         """Copy object using single API call."""
 
         await self._wait_until_active(session)
+        source_payload = await self._read_source_payload(
+            source_client,
+            session.plan.source,
+            part_range=None,
+        )
         await asyncio.to_thread(
-            client.copy_object,
+            destination_client.put_object,
             Bucket=session.plan.destination.bucket,
             Key=session.plan.destination.key,
-            CopySource={
-                "Bucket": session.plan.source.bucket,
-                "Key": session.plan.source.key,
-            },
+            Body=source_payload,
         )
 
-    async def _copy_multipart(self, client: S3Client, session: TransferSession, size: int) -> None:
+    async def _copy_multipart(
+        self,
+        source_client: S3Client,
+        destination_client: S3Client,
+        session: TransferSession,
+        size: int,
+    ) -> None:
         """Copy object with multipart upload and resumable part tracking."""
 
         if session.upload_id is None:
             response = await asyncio.to_thread(
-                client.create_multipart_upload,
+                destination_client.create_multipart_upload,
                 Bucket=session.plan.destination.bucket,
                 Key=session.plan.destination.key,
             )
@@ -336,7 +371,8 @@ class S3TransferExecutor(TransferExecutor):
             results = await asyncio.gather(
                 *[
                     self._copy_part(
-                        client=client,
+                        source_client=source_client,
+                        destination_client=destination_client,
                         session=session,
                         part_number=part_number,
                         part_size=part_size,
@@ -354,7 +390,7 @@ class S3TransferExecutor(TransferExecutor):
         ]
         await self._wait_until_active(session)
         await asyncio.to_thread(
-            client.complete_multipart_upload,
+            destination_client.complete_multipart_upload,
             Bucket=session.plan.destination.bucket,
             Key=session.plan.destination.key,
             UploadId=session.upload_id,
@@ -364,7 +400,8 @@ class S3TransferExecutor(TransferExecutor):
 
     async def _copy_part(
         self,
-        client: S3Client,
+        source_client: S3Client,
+        destination_client: S3Client,
         session: TransferSession,
         part_number: int,
         part_size: int,
@@ -376,17 +413,18 @@ class S3TransferExecutor(TransferExecutor):
         start = (part_number - 1) * part_size
         end = min(object_size - 1, start + part_size - 1)
 
+        payload = await self._read_source_payload(
+            source_client,
+            session.plan.source,
+            part_range=(start, end),
+        )
         response = await asyncio.to_thread(
-            client.upload_part_copy,
+            destination_client.upload_part,
             Bucket=session.plan.destination.bucket,
             Key=session.plan.destination.key,
             UploadId=session.upload_id,
             PartNumber=part_number,
-            CopySource={
-                "Bucket": session.plan.source.bucket,
-                "Key": session.plan.source.key,
-            },
-            CopySourceRange=f"bytes={start}-{end}",
+            Body=payload,
         )
         return part_number, self._extract_etag(response)
 
@@ -398,6 +436,45 @@ class S3TransferExecutor(TransferExecutor):
         if not isinstance(size, int):
             raise RuntimeError("head_object did not return ContentLength")
         return size
+
+    async def _read_source_payload(
+        self,
+        client: S3Client,
+        source: S3ObjectRef,
+        part_range: tuple[int, int] | None,
+    ) -> bytes:
+        """Read source bytes for single-part or one multipart segment."""
+
+        range_header: str | None = None
+        if part_range is not None:
+            start, end = part_range
+            range_header = f"bytes={start}-{end}"
+
+        response = await asyncio.to_thread(
+            client.get_object,
+            Bucket=source.bucket,
+            Key=source.key,
+            Range=range_header,
+        )
+        body = response.get("Body")
+        if body is None:
+            raise RuntimeError("get_object did not return Body")
+        payload = await asyncio.to_thread(self._read_stream_body, body)
+        if not isinstance(payload, bytes):
+            raise RuntimeError("get_object Body did not resolve to bytes")
+        return payload
+
+    def _read_stream_body(self, body: Any) -> bytes:
+        """Normalize S3 response body content to bytes."""
+
+        if isinstance(body, bytes):
+            return body
+        if hasattr(body, "read"):
+            payload = body.read()
+            if isinstance(payload, bytes):
+                return payload
+            raise RuntimeError("S3 response body .read() did not return bytes")
+        raise RuntimeError("S3 response body is not readable")
 
     async def _wait_until_active(self, session: TransferSession) -> None:
         """Pause transfer loop while suspended."""
@@ -415,7 +492,11 @@ class S3TransferExecutor(TransferExecutor):
         if session.upload_id is None:
             return
 
-        client = self._s3_client_factory(session.plan.destination.region or self._default_region)
+        client = self._s3_client_factory(
+            session.plan.destination.region or self._default_region,
+            session.plan.destination.endpoint_url,
+            session.plan.destination.force_path_style,
+        )
         with suppress(Exception):
             await asyncio.to_thread(
                 client.abort_multipart_upload,
@@ -482,6 +563,10 @@ class S3TransferExecutor(TransferExecutor):
         if data_address is not None:
             return self._parse_data_address(data_address)
 
+        metadata_address = self._pick_data_address(metadata, target)
+        if metadata_address is not None:
+            return self._parse_data_address(metadata_address)
+
         bucket = self._pick_value(metadata, target, "Bucket")
         key = self._pick_value(metadata, target, "Key")
         if bucket is None or key is None:
@@ -493,6 +578,8 @@ class S3TransferExecutor(TransferExecutor):
             bucket=bucket,
             key=key,
             region=self._pick_region(metadata, target),
+            endpoint_url=self._pick_endpoint_url(metadata, target),
+            force_path_style=self._pick_force_path_style(metadata, target),
         )
 
     def _parse_data_address(self, data_address: DataAddress) -> S3ObjectRef:
@@ -500,19 +587,38 @@ class S3TransferExecutor(TransferExecutor):
 
         endpoint = data_address.endpoint
         parsed = urlparse(endpoint)
-        if parsed.scheme.lower() != "s3":
+        scheme = parsed.scheme.lower()
+        endpoint_url = self._endpoint_url_from_address(data_address)
+
+        if scheme == "s3":
+            bucket = parsed.netloc
+            key = parsed.path.lstrip("/")
+        elif scheme in {"http", "https"}:
+            path_parts = parsed.path.lstrip("/").split("/", 1)
+            if len(path_parts) != 2:
+                raise DataFlowValidationError(
+                    f"Invalid HTTP S3 endpoint '{endpoint}', expected http(s)://host/bucket/key."
+                )
+            bucket, key = path_parts
+            endpoint_url = endpoint_url or f"{parsed.scheme}://{parsed.netloc}"
+        else:
             raise DataFlowValidationError(
-                f"Unsupported dataAddress endpoint '{endpoint}', expected s3://bucket/key."
+                f"Unsupported dataAddress endpoint '{endpoint}', expected s3://bucket/key "
+                "or http(s)://host/bucket/key."
             )
 
-        bucket = parsed.netloc
-        key = parsed.path.lstrip("/")
         if not bucket or not key:
             raise DataFlowValidationError(
                 f"Invalid S3 endpoint '{endpoint}', expected s3://bucket/key."
             )
 
-        return S3ObjectRef(bucket=bucket, key=key, region=self._region_from_address(data_address))
+        return S3ObjectRef(
+            bucket=bucket,
+            key=key,
+            region=self._region_from_address(data_address),
+            endpoint_url=endpoint_url,
+            force_path_style=self._force_path_style_from_address(data_address),
+        )
 
     def _region_from_address(self, data_address: DataAddress) -> str | None:
         """Extract region from endpoint properties when available."""
@@ -522,8 +628,28 @@ class S3TransferExecutor(TransferExecutor):
                 return prop.value
         return None
 
+    def _endpoint_url_from_address(self, data_address: DataAddress) -> str | None:
+        """Extract endpoint URL override from endpoint properties."""
+
+        for prop in data_address.endpoint_properties:
+            if prop.name.lower() in {"endpointurl", "s3endpointurl"}:
+                return prop.value
+        return None
+
+    def _force_path_style_from_address(self, data_address: DataAddress) -> bool:
+        """Extract path-style flag from endpoint properties."""
+
+        for prop in data_address.endpoint_properties:
+            if prop.name.lower() == "forcepathstyle":
+                return self._coerce_bool(prop.value)
+        return False
+
     def _build_data_address(self, metadata: dict[str, Any], target: str) -> DataAddress | None:
         """Construct an S3 DataAddress from metadata."""
+
+        metadata_address = self._pick_data_address(metadata, target)
+        if metadata_address is not None:
+            return metadata_address
 
         bucket = self._pick_value(metadata, target, "Bucket")
         if bucket is None:
@@ -537,6 +663,14 @@ class S3TransferExecutor(TransferExecutor):
         ]
         if region := self._pick_region(metadata, target):
             endpoint_properties.append(EndpointProperty(name="region", value=region))
+        if endpoint_url := self._pick_endpoint_url(metadata, target):
+            endpoint_properties.append(
+                EndpointProperty(name="endpointUrl", value=endpoint_url),
+            )
+        if self._pick_force_path_style(metadata, target):
+            endpoint_properties.append(
+                EndpointProperty(name="forcePathStyle", value="true"),
+            )
 
         return DataAddress(
             type_="DataAddress",
@@ -554,6 +688,48 @@ class S3TransferExecutor(TransferExecutor):
         if "region" in metadata:
             return str(metadata["region"])
         return None
+
+    def _pick_endpoint_url(self, metadata: dict[str, Any], target: str) -> str | None:
+        """Read best-effort endpoint URL metadata key variants."""
+
+        for key in (f"{target}EndpointUrl", f"{target}S3EndpointUrl"):
+            if key in metadata:
+                return str(metadata[key])
+        if "endpointUrl" in metadata:
+            return str(metadata["endpointUrl"])
+        return None
+
+    def _pick_force_path_style(self, metadata: dict[str, Any], target: str) -> bool:
+        """Read best-effort path-style setting from metadata."""
+
+        for key in (f"{target}ForcePathStyle", "forcePathStyle"):
+            if key in metadata:
+                return self._coerce_bool(metadata[key])
+        return False
+
+    def _pick_data_address(
+        self,
+        metadata: dict[str, Any],
+        target: str,
+    ) -> DataAddress | None:
+        """Read an optional target-specific DataAddress from metadata."""
+
+        key = f"{target}DataAddress"
+        raw = metadata.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, DataAddress):
+            return raw
+        if isinstance(raw, dict):
+            try:
+                return DataAddress.model_validate(raw)
+            except ValidationError as exc:
+                raise DataFlowValidationError(
+                    f"Invalid metadata['{key}'] DataAddress payload: {exc}"
+                ) from exc
+        raise DataFlowValidationError(
+            f"metadata['{key}'] must be an object matching DataAddress."
+        )
 
     def _pick_value(self, metadata: dict[str, Any], target: str, suffix: str) -> str | None:
         """Read best-effort metadata key variants."""
@@ -585,30 +761,53 @@ class S3TransferExecutor(TransferExecutor):
             return fallback
         return fallback if parsed <= 0 else parsed
 
+    def _coerce_bool(self, raw: object) -> bool:
+        """Convert flexible values to boolean."""
+
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(raw, int):
+            return raw != 0
+        return False
+
     def _extract_etag(self, response: dict[str, Any]) -> str:
-        """Extract part ETag from upload_part_copy response."""
+        """Extract part ETag from multipart upload response."""
 
-        copy_part_result = cast(dict[str, Any] | None, response.get("CopyPartResult"))
-        if copy_part_result is None:
-            raise RuntimeError("upload_part_copy did not return CopyPartResult")
-
-        etag = copy_part_result.get("ETag")
+        etag = response.get("ETag")
+        if not isinstance(etag, str):
+            copy_part_result = cast(dict[str, Any] | None, response.get("CopyPartResult"))
+            if copy_part_result is not None:
+                etag = copy_part_result.get("ETag")
         if not isinstance(etag, str) or not etag:
-            raise RuntimeError("upload_part_copy did not return CopyPartResult.ETag")
+            raise RuntimeError("Multipart part upload did not return ETag")
         return etag
 
-    def _build_default_s3_client(self, region: str | None) -> S3Client:
+    def _build_default_s3_client(
+        self,
+        region: str | None,
+        endpoint_url: str | None,
+        force_path_style: bool,
+    ) -> S3Client:
         """Create a boto3 S3 client lazily to avoid import-time hard dependency."""
 
         try:
             import boto3  # type: ignore[import-not-found]
+            from botocore.config import Config
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "boto3 is required for S3 transfer execution. Install project dependencies first."
             ) from exc
 
         resolved_region = region or self._default_region
-        client = boto3.client("s3", region_name=resolved_region)
+        client_kwargs: dict[str, object] = {"region_name": resolved_region}
+        if endpoint_url:
+            client_kwargs["endpoint_url"] = endpoint_url
+        if force_path_style:
+            client_kwargs["config"] = Config(s3={"addressing_style": "path"})
+
+        client = boto3.client("s3", **client_kwargs)
         return cast(S3Client, client)
 
 

@@ -1,0 +1,50 @@
+services:
+  minio-a:
+    image: quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+
+  minio-b:
+    image: quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19010:9000"
+      - "19011:9001"
+
+  dataplane-a:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      SIMPL_DP_DATAPLANE_ID: dataplane-a
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "18081:8080"
+    depends_on:
+      - minio-a
+      - minio-b
+
+  dataplane-b:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      SIMPL_DP_DATAPLANE_ID: dataplane-b
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "18082:8080"
+    depends_on:
+      - minio-a
+      - minio-b

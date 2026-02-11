@@ -17,50 +17,77 @@ class FakeS3Client:
     def __init__(
         self, object_sizes: dict[tuple[str, str], int], part_delay_seconds: float = 0.0
     ) -> None:
-        self._object_sizes = dict(object_sizes)
+        self._objects = {
+            object_ref: b"x" * size for object_ref, size in object_sizes.items()
+        }
         self._part_delay_seconds = part_delay_seconds
         self._upload_counter = 0
+        self._multipart_uploads: dict[str, tuple[str, str, dict[int, bytes]]] = {}
         self._lock = threading.Lock()
-        self.copy_calls = 0
+        self.put_calls = 0
+        self.get_calls = 0
         self.multipart_upload_calls = 0
         self.uploaded_part_numbers: list[int] = []
         self.complete_calls = 0
         self.abort_calls = 0
 
     def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
-        return {"ContentLength": self._object_sizes[(Bucket, Key)]}
+        return {"ContentLength": len(self._objects[(Bucket, Key)])}
 
-    def copy_object(self, *, Bucket: str, Key: str, CopySource: dict[str, str]) -> dict[str, Any]:
+    def get_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        Range: str | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
-            self.copy_calls += 1
-            source = (CopySource["Bucket"], CopySource["Key"])
-            self._object_sizes[(Bucket, Key)] = self._object_sizes[source]
-        return {}
+            self.get_calls += 1
+            payload = self._objects[(Bucket, Key)]
+
+        if Range is None:
+            return {"Body": payload}
+
+        prefix = "bytes="
+        if not Range.startswith(prefix):
+            raise ValueError(f"Unsupported range: {Range}")
+        start_str, end_str = Range[len(prefix) :].split("-", 1)
+        start = int(start_str)
+        end = int(end_str)
+        return {"Body": payload[start : end + 1]}
+
+    def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> dict[str, Any]:
+        with self._lock:
+            self.put_calls += 1
+            self._objects[(Bucket, Key)] = Body
+        return {"ETag": "etag-single-part"}
 
     def create_multipart_upload(self, *, Bucket: str, Key: str) -> dict[str, Any]:
-        _ = (Bucket, Key)
         with self._lock:
             self.multipart_upload_calls += 1
             self._upload_counter += 1
             upload_id = f"upload-{self._upload_counter}"
+            self._multipart_uploads[upload_id] = (Bucket, Key, {})
         return {"UploadId": upload_id}
 
-    def upload_part_copy(
+    def upload_part(
         self,
         *,
         Bucket: str,
         Key: str,
         UploadId: str,
         PartNumber: int,
-        CopySource: dict[str, str],
-        CopySourceRange: str,
+        Body: bytes,
     ) -> dict[str, Any]:
-        _ = (Bucket, Key, UploadId, CopySource, CopySourceRange)
         if self._part_delay_seconds:
             time.sleep(self._part_delay_seconds)
         with self._lock:
+            upload_bucket, upload_key, parts = self._multipart_uploads[UploadId]
+            assert upload_bucket == Bucket
+            assert upload_key == Key
+            parts[PartNumber] = Body
             self.uploaded_part_numbers.append(PartNumber)
-        return {"CopyPartResult": {"ETag": f"etag-{PartNumber}"}}
+        return {"ETag": f"etag-{PartNumber}"}
 
     def complete_multipart_upload(
         self,
@@ -70,15 +97,19 @@ class FakeS3Client:
         UploadId: str,
         MultipartUpload: dict[str, list[dict[str, str | int]]],
     ) -> dict[str, Any]:
-        _ = (Bucket, Key, UploadId, MultipartUpload)
         with self._lock:
             self.complete_calls += 1
+            upload_bucket, upload_key, parts = self._multipart_uploads.pop(UploadId)
+            assert upload_bucket == Bucket
+            assert upload_key == Key
+            ordered_parts = [parts[part["PartNumber"]] for part in MultipartUpload["Parts"]]
+            self._objects[(Bucket, Key)] = b"".join(ordered_parts)
         return {}
 
     def abort_multipart_upload(self, *, Bucket: str, Key: str, UploadId: str) -> dict[str, Any]:
-        _ = (Bucket, Key, UploadId)
         with self._lock:
             self.abort_calls += 1
+            self._multipart_uploads.pop(UploadId, None)
         return {}
 
 
@@ -131,7 +162,7 @@ def test_push_start_uses_multipart_copy_async() -> None:
     executor = S3TransferExecutor(
         multipart_threshold_mb=5,
         multipart_part_size_mb=5,
-        s3_client_factory=lambda _: fake_client,
+        s3_client_factory=lambda *_: fake_client,
     )
 
     data_flow = _build_data_flow("multipart")
@@ -143,7 +174,7 @@ def test_push_start_uses_multipart_copy_async() -> None:
 
     asyncio.run(scenario())
 
-    assert fake_client.copy_calls == 0
+    assert fake_client.put_calls == 0
     assert fake_client.multipart_upload_calls == 1
     assert sorted(fake_client.uploaded_part_numbers) == [1, 2, 3]
     assert fake_client.complete_calls == 1
@@ -157,7 +188,7 @@ def test_suspend_then_resume_continues_multipart_transfer() -> None:
     executor = S3TransferExecutor(
         multipart_threshold_mb=5,
         multipart_part_size_mb=5,
-        s3_client_factory=lambda _: fake_client,
+        s3_client_factory=lambda *_: fake_client,
     )
 
     data_flow = _build_data_flow("resume")
