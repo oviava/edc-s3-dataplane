@@ -35,6 +35,20 @@ Run Docker end-to-end test (2 MinIO + 2 dataplanes, 100MB transfer, suspend/resu
 RUN_DOCKER_E2E=1 pytest -q -m e2e tests/e2e/test_transfer_resume_e2e.py
 ```
 
+Run local Postgres (for `postgres` repository backend):
+
+```bash
+docker compose up -d postgres
+```
+
+Then run the dataplane with Postgres persistence:
+
+```bash
+SIMPL_DP_REPOSITORY_BACKEND=postgres \
+SIMPL_DP_POSTGRES_DSN=postgresql://simpl:simpl@localhost:5432/simpl_dataplane \
+uvicorn simpl_bulk_dataplane.main:app --reload --port 8080
+```
+
 ## Notes
 
 - Endpoints are scaffolded from `docs/signaling-openapi.yaml`.
@@ -49,3 +63,6 @@ RUN_DOCKER_E2E=1 pytest -q -m e2e tests/e2e/test_transfer_resume_e2e.py
   - `<target>EndpointUrl`, `<target>ForcePathStyle` (`target` = `source` or `destination`)
   - `<target>AccessKeyId`, `<target>SecretAccessKey`, `<target>SessionToken`
   - `multipartThresholdMb`, `multipartPartSizeMb`, `multipartConcurrency`
+- Repository backend configuration:
+  - `SIMPL_DP_REPOSITORY_BACKEND=in_memory` (default) or `postgres`
+  - `SIMPL_DP_POSTGRES_DSN` is required when backend is `postgres`

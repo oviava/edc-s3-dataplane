@@ -25,6 +25,7 @@ services:
       dockerfile: Dockerfile
     environment:
       SIMPL_DP_DATAPLANE_ID: dataplane-a
+      SIMPL_DP_REPOSITORY_BACKEND: in_memory
     ports:
       - "18081:8080"
     depends_on:
@@ -37,6 +38,7 @@ services:
       dockerfile: Dockerfile
     environment:
       SIMPL_DP_DATAPLANE_ID: dataplane-b
+      SIMPL_DP_REPOSITORY_BACKEND: in_memory
     ports:
       - "18082:8080"
     depends_on:
