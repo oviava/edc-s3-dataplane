@@ -30,6 +30,8 @@ uvicorn simpl_bulk_dataplane.main:app --reload --port 8080
 Run the separate manual E2E UI app:
 
 ```bash
+SIMPL_MANUAL_MQTT_ENABLED=true \
+SIMPL_MANUAL_MQTT_HOST=localhost \
 uvicorn simpl_bulk_manual_app.main:app --reload --port 8090
 ```
 
@@ -39,6 +41,28 @@ Or via console scripts:
 simpl-bulk-dataplane
 simpl-bulk-manual-ui
 ```
+
+Run full manual stack (manual UI + 2 dataplanes + 2 Postgres + RabbitMQ MQTT broker + 2 MinIO):
+
+```bash
+docker compose -f docker-compose.manual.yml up -d --build
+```
+
+If you changed startup settings, recreate services:
+
+```bash
+docker compose -f docker-compose.manual.yml down -v
+docker compose -f docker-compose.manual.yml up -d --build
+```
+
+Endpoints:
+- Manual UI: `http://localhost:18090`
+- Dataplane A: `http://localhost:18081`
+- Dataplane B: `http://localhost:18082`
+- RabbitMQ MQTT: `localhost:1883`
+- RabbitMQ management: `http://localhost:15672` (`guest` / `guest`)
+- MinIO A API/console: `http://localhost:19000` / `http://localhost:19001`
+- MinIO B API/console: `http://localhost:19010` / `http://localhost:19011`
 
 ## Run tests
 
@@ -79,6 +103,38 @@ Pause/resume behavior remains on signaling endpoints:
 - Resume:
   - Push flows: call `POST /dataflows/start` again
   - Pull flows: call `POST /dataflows/{id}/started` (or replay `start` + `started`)
+
+## MQTT dataflow events (RabbitMQ MQTT plugin compatible)
+
+Dataplane can publish dataflow state/progress events to MQTT:
+
+```bash
+SIMPL_DP_DATAFLOW_EVENTS_MQTT_ENABLED=true
+SIMPL_DP_DATAFLOW_EVENTS_MQTT_HOST=localhost
+SIMPL_DP_DATAFLOW_EVENTS_MQTT_PORT=1883
+SIMPL_DP_DATAFLOW_EVENTS_MQTT_TOPIC_PREFIX=simpl/dataplane
+SIMPL_DP_DATAFLOW_EVENTS_MQTT_QOS=0
+# optional
+SIMPL_DP_DATAFLOW_EVENTS_MQTT_USERNAME=guest
+SIMPL_DP_DATAFLOW_EVENTS_MQTT_PASSWORD=guest
+SIMPL_DP_DATAPLANE_PUBLIC_URL=http://localhost:8080
+```
+
+Published topics:
+- `<topicPrefix>/<dataplaneId>/dataflows/<dataFlowId>/state`
+- `<topicPrefix>/<dataplaneId>/dataflows/<dataFlowId>/progress`
+
+Manual UI consumes MQTT events directly (no dataplane polling fallback):
+
+```bash
+SIMPL_MANUAL_MQTT_ENABLED=true
+SIMPL_MANUAL_MQTT_HOST=localhost
+SIMPL_MANUAL_MQTT_PORT=1883
+SIMPL_MANUAL_MQTT_TOPIC_PREFIX=simpl/dataplane
+# optional
+SIMPL_MANUAL_MQTT_USERNAME=guest
+SIMPL_MANUAL_MQTT_PASSWORD=guest
+```
 
 ## Notes
 

@@ -31,3 +31,8 @@ def test_build_dataflow_service_uses_postgres_repository_when_configured() -> No
 def test_settings_require_postgres_dsn_when_backend_is_postgres() -> None:
     with pytest.raises(ValidationError):
         Settings(repository_backend=RepositoryBackend.POSTGRES)
+
+
+def test_settings_require_mqtt_host_when_mqtt_events_are_enabled() -> None:
+    with pytest.raises(ValidationError):
+        Settings(dataflow_events_mqtt_enabled=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -20,6 +21,7 @@ from simpl_bulk_dataplane.domain.monitoring_models import (
 )
 from simpl_bulk_dataplane.domain.ports import (
     ControlPlaneNotifier,
+    DataFlowEventPublisher,
     DataFlowRepository,
     TransferExecutor,
 )
@@ -59,11 +61,13 @@ class DataFlowService:
         repository: DataFlowRepository,
         transfer_executor: TransferExecutor,
         control_plane_notifier: ControlPlaneNotifier,
+        dataflow_event_publisher: DataFlowEventPublisher,
     ) -> None:
         self._dataplane_id = dataplane_id
         self._repository = repository
         self._transfer_executor = transfer_executor
         self._control_plane_notifier = control_plane_notifier
+        self._dataflow_event_publisher = dataflow_event_publisher
 
     async def prepare(self, message: DataFlowPrepareMessage) -> CommandResult:
         """Handle `/dataflows/prepare`."""
@@ -81,6 +85,7 @@ class DataFlowService:
         if self._is_async_requested(message.metadata, "Prepare"):
             data_flow.state = DataFlowState.PREPARING
             await self._repository.upsert(data_flow)
+            await self._publish_state_event(data_flow)
             return CommandResult(
                 status_code=202,
                 body=self._response_message(data_flow),
@@ -95,6 +100,7 @@ class DataFlowService:
         await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
         await self._control_plane_notifier.notify_prepared(data_flow, response)
+        await self._publish_state_event(data_flow)
         return CommandResult(status_code=200, body=response)
 
     async def start(self, message: DataFlowStartMessage) -> CommandResult:
@@ -137,6 +143,7 @@ class DataFlowService:
         if self._is_async_requested(message.metadata, "Start"):
             data_flow.state = DataFlowState.STARTING
             await self._repository.upsert(data_flow)
+            await self._publish_state_event(data_flow)
             return CommandResult(
                 status_code=202,
                 body=self._response_message(data_flow),
@@ -155,6 +162,7 @@ class DataFlowService:
         await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
         await self._control_plane_notifier.notify_started(data_flow, response)
+        await self._publish_state_event(data_flow)
         return CommandResult(status_code=200, body=response)
 
     async def notify_started(
@@ -184,6 +192,7 @@ class DataFlowService:
         await self._transfer_executor.notify_started(data_flow, effective_message)
         data_flow.state = DataFlowState.STARTED
         await self._repository.upsert(data_flow)
+        await self._publish_state_event(data_flow)
 
     async def suspend(self, data_flow_id: str, reason: str | None) -> None:
         """Handle `/dataflows/{id}/suspend`."""
@@ -197,6 +206,7 @@ class DataFlowService:
         await self._transfer_executor.suspend(data_flow, reason)
         data_flow.state = DataFlowState.SUSPENDED
         await self._repository.upsert(data_flow)
+        await self._publish_state_event(data_flow)
 
     async def terminate(self, data_flow_id: str, reason: str | None) -> None:
         """Handle `/dataflows/{id}/terminate`."""
@@ -210,6 +220,7 @@ class DataFlowService:
         await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
         await self._control_plane_notifier.notify_terminated(data_flow, response)
+        await self._publish_state_event(data_flow)
 
     async def completed(self, data_flow_id: str) -> None:
         """Handle `/dataflows/{id}/completed`."""
@@ -223,6 +234,7 @@ class DataFlowService:
         await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
         await self._control_plane_notifier.notify_completed(data_flow, response)
+        await self._publish_state_event(data_flow)
 
     async def get_status(self, data_flow_id: str) -> DataFlowStatusResponseMessage:
         """Handle `/dataflows/{id}/status`."""
@@ -433,6 +445,13 @@ class DataFlowService:
             bucket, key = path_parts
             return (bucket or None), (key or None)
         return None, None
+
+    async def _publish_state_event(self, data_flow: DataFlow) -> None:
+        """Publish state events without affecting core signaling behavior."""
+
+        progress = await self._transfer_executor.get_progress(data_flow.data_flow_id)
+        with suppress(Exception):
+            await self._dataflow_event_publisher.publish_state(data_flow, progress)
 
 
 __all__ = ["CommandResult", "DataFlowService"]

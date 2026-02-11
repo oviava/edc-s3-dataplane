@@ -15,6 +15,7 @@ from simpl_bulk_dataplane.domain.signaling_models import (
 )
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState
 from simpl_bulk_dataplane.infrastructure.callbacks import NoopControlPlaneNotifier
+from simpl_bulk_dataplane.infrastructure.events import NoopDataFlowEventPublisher
 from simpl_bulk_dataplane.infrastructure.repositories import InMemoryDataFlowRepository
 from simpl_bulk_dataplane.infrastructure.transfers import S3TransferExecutor
 
@@ -26,6 +27,7 @@ def service() -> DataFlowService:
         repository=InMemoryDataFlowRepository(),
         transfer_executor=S3TransferExecutor(),
         control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
     )
 
 
@@ -134,6 +136,7 @@ def test_start_can_resume_push_without_repeating_data_address() -> None:
         repository=InMemoryDataFlowRepository(),
         transfer_executor=transfer_executor,
         control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
     )
 
     initial = DataFlowStartMessage(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simpl_bulk_dataplane.domain.transfer_types import TransferMode
 
@@ -24,8 +24,45 @@ class StartTransferRequest(UiModel):
     destination_key: str = Field(alias="destinationKey")
     source_endpoint_url: str | None = Field(default=None, alias="sourceEndpointUrl")
     destination_endpoint_url: str | None = Field(default=None, alias="destinationEndpointUrl")
+    source_access_key_id: str | None = Field(default=None, alias="sourceAccessKeyId")
+    source_secret_access_key: str | None = Field(default=None, alias="sourceSecretAccessKey")
+    destination_access_key_id: str | None = Field(default=None, alias="destinationAccessKeyId")
+    destination_secret_access_key: str | None = Field(
+        default=None, alias="destinationSecretAccessKey"
+    )
     process_id: str | None = Field(default=None, alias="processId")
     auto_started_notification: bool = Field(default=True, alias="autoStartedNotification")
+
+    @model_validator(mode="after")
+    def validate_s3_credential_pairs(self) -> StartTransferRequest:
+        """Require complete static credential pairs per source/destination."""
+
+        self._validate_pair(
+            access_key_id=self.source_access_key_id,
+            secret_access_key=self.source_secret_access_key,
+            scope="source",
+        )
+        self._validate_pair(
+            access_key_id=self.destination_access_key_id,
+            secret_access_key=self.destination_secret_access_key,
+            scope="destination",
+        )
+        return self
+
+    @staticmethod
+    def _validate_pair(
+        *,
+        access_key_id: str | None,
+        secret_access_key: str | None,
+        scope: str,
+    ) -> None:
+        """Reject partial static credential configuration."""
+
+        if (access_key_id is None) == (secret_access_key is None):
+            return
+        raise ValueError(
+            f"{scope}AccessKeyId and {scope}SecretAccessKey must be set together."
+        )
 
 
 class PauseTransferRequest(UiModel):

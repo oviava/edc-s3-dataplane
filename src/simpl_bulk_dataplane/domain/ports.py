@@ -80,4 +80,28 @@ class ControlPlaneNotifier(Protocol):
         """Signal TERMINATED state to control plane."""
 
 
-__all__ = ["ControlPlaneNotifier", "DataFlowRepository", "TransferExecutor"]
+class DataFlowEventPublisher(Protocol):
+    """Outbound event publisher for dataflow state/progress updates."""
+
+    async def publish_state(
+        self,
+        data_flow: DataFlow,
+        progress: TransferProgressSnapshot | None = None,
+    ) -> None:
+        """Publish state-oriented flow event."""
+
+    async def publish_progress(
+        self,
+        data_flow_id: str,
+        progress: TransferProgressSnapshot,
+        data_flow: DataFlow | None = None,
+    ) -> None:
+        """Publish progress-oriented flow event."""
+
+
+__all__ = [
+    "ControlPlaneNotifier",
+    "DataFlowEventPublisher",
+    "DataFlowRepository",
+    "TransferExecutor",
+]

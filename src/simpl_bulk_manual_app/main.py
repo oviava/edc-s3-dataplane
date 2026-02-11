@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -25,6 +24,7 @@ from simpl_bulk_manual_app.models import (
     StartTransferRequest,
     StartTransferResponse,
 )
+from simpl_bulk_manual_app.mqtt_events import MqttDataFlowEventStore
 
 _PARTICIPANT_ID = "did:web:manual-provider"
 _COUNTER_PARTY_ID = "did:web:manual-consumer"
@@ -63,6 +63,58 @@ def _default_dataplane_urls() -> list[str]:
     return deduped
 
 
+def _mqtt_enabled() -> bool:
+    raw = os.getenv("SIMPL_MANUAL_MQTT_ENABLED", "false").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _build_s3_data_address(
+    *,
+    bucket: str,
+    key: str,
+    endpoint_url: str | None = None,
+    access_key_id: str | None = None,
+    secret_access_key: str | None = None,
+) -> dict[str, Any]:
+    """Build a DataAddress payload for S3-compatible storage."""
+
+    endpoint_properties: list[dict[str, str]] = [{"name": "storageType", "value": "s3"}]
+    if endpoint_url:
+        endpoint_properties.append({"name": "endpointUrl", "value": endpoint_url})
+    if access_key_id:
+        endpoint_properties.append({"name": "accessKeyId", "value": access_key_id})
+    if secret_access_key:
+        endpoint_properties.append({"name": "secretAccessKey", "value": secret_access_key})
+
+    return {
+        "@type": "DataAddress",
+        "endpointType": "urn:aws:s3",
+        "endpoint": f"s3://{bucket}/{key}",
+        "endpointProperties": endpoint_properties,
+    }
+
+
+def _build_optional_metadata_data_address(
+    *,
+    bucket: str,
+    key: str,
+    endpoint_url: str | None = None,
+    access_key_id: str | None = None,
+    secret_access_key: str | None = None,
+) -> dict[str, Any] | None:
+    """Build metadata DataAddress only when extra S3 connection hints are provided."""
+
+    if endpoint_url is None and access_key_id is None and secret_access_key is None:
+        return None
+    return _build_s3_data_address(
+        bucket=bucket,
+        key=key,
+        endpoint_url=endpoint_url,
+        access_key_id=access_key_id,
+        secret_access_key=secret_access_key,
+    )
+
+
 def _build_start_payload(request: StartTransferRequest, process_id: str) -> dict[str, Any]:
     transfer_type = f"com.test.s3-{request.transfer_mode.value}"
     metadata: dict[str, Any] = {
@@ -75,6 +127,24 @@ def _build_start_payload(request: StartTransferRequest, process_id: str) -> dict
         metadata["sourceEndpointUrl"] = request.source_endpoint_url
     if request.destination_endpoint_url:
         metadata["destinationEndpointUrl"] = request.destination_endpoint_url
+    source_data_address = _build_optional_metadata_data_address(
+        bucket=request.source_bucket,
+        key=request.source_key,
+        endpoint_url=request.source_endpoint_url,
+        access_key_id=request.source_access_key_id,
+        secret_access_key=request.source_secret_access_key,
+    )
+    if source_data_address is not None:
+        metadata["sourceDataAddress"] = source_data_address
+    destination_data_address = _build_optional_metadata_data_address(
+        bucket=request.destination_bucket,
+        key=request.destination_key,
+        endpoint_url=request.destination_endpoint_url,
+        access_key_id=request.destination_access_key_id,
+        secret_access_key=request.destination_secret_access_key,
+    )
+    if destination_data_address is not None:
+        metadata["destinationDataAddress"] = destination_data_address
 
     payload: dict[str, Any] = {
         "messageId": f"manual-msg-{uuid4()}",
@@ -91,18 +161,13 @@ def _build_start_payload(request: StartTransferRequest, process_id: str) -> dict
     }
 
     if request.transfer_mode is TransferMode.PUSH:
-        endpoint_properties: list[dict[str, str]] = [{"name": "storageType", "value": "s3"}]
-        if request.destination_endpoint_url:
-            endpoint_properties.append(
-                {"name": "endpointUrl", "value": request.destination_endpoint_url}
-            )
-
-        payload["dataAddress"] = {
-            "@type": "DataAddress",
-            "endpointType": "urn:aws:s3",
-            "endpoint": f"s3://{request.destination_bucket}/{request.destination_key}",
-            "endpointProperties": endpoint_properties,
-        }
+        payload["dataAddress"] = _build_s3_data_address(
+            bucket=request.destination_bucket,
+            key=request.destination_key,
+            endpoint_url=request.destination_endpoint_url,
+            access_key_id=request.destination_access_key_id,
+            secret_access_key=request.destination_secret_access_key,
+        )
     return payload
 
 
@@ -111,9 +176,27 @@ async def _lifespan(app: FastAPI):
     app.state.dataplane_client = DataPlaneClient()
     app.state.replay_commands: dict[tuple[str, str], ReplayCommand] = {}
     app.state.default_dataplane_urls = _default_dataplane_urls()
+    app.state.mqtt_event_store = None
+
+    if _mqtt_enabled():
+        mqtt_host = os.getenv("SIMPL_MANUAL_MQTT_HOST")
+        if mqtt_host is None or not mqtt_host.strip():
+            raise RuntimeError(
+                "SIMPL_MANUAL_MQTT_HOST is required when SIMPL_MANUAL_MQTT_ENABLED=true."
+            )
+        app.state.mqtt_event_store = MqttDataFlowEventStore(
+            broker_host=mqtt_host,
+            broker_port=int(os.getenv("SIMPL_MANUAL_MQTT_PORT", "1883")),
+            topic_prefix=os.getenv("SIMPL_MANUAL_MQTT_TOPIC_PREFIX", "simpl/dataplane"),
+            username=os.getenv("SIMPL_MANUAL_MQTT_USERNAME"),
+            password=os.getenv("SIMPL_MANUAL_MQTT_PASSWORD"),
+        )
     try:
         yield
     finally:
+        mqtt_event_store: MqttDataFlowEventStore | None = app.state.mqtt_event_store
+        if mqtt_event_store is not None:
+            mqtt_event_store.close()
         await app.state.dataplane_client.close()
 
 
@@ -131,6 +214,7 @@ def create_app() -> FastAPI:
     async def get_config(request: Request) -> dict[str, object]:
         return {
             "defaultDataplaneUrls": list(request.app.state.default_dataplane_urls),
+            "mqttMonitoringEnabled": request.app.state.mqtt_event_store is not None,
         }
 
     @app.post("/api/transfers/start", response_model=StartTransferResponse, status_code=200)
@@ -191,40 +275,52 @@ def create_app() -> FastAPI:
         body: DataflowQueryRequest,
         request: Request,
     ) -> DataflowQueryResponse:
-        client: DataPlaneClient = request.app.state.dataplane_client
+        mqtt_event_store: MqttDataFlowEventStore | None = request.app.state.mqtt_event_store
+        if mqtt_event_store is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "MQTT monitoring is not enabled. Configure SIMPL_MANUAL_MQTT_ENABLED=true "
+                    "and MQTT connection settings."
+                ),
+            )
+
         urls: list[str] = []
         for value in body.dataplane_urls:
             normalized = _normalize_dataplane_url(value)
             if normalized not in urls:
                 urls.append(normalized)
 
-        async def poll_one(dataplane_url: str) -> DataplanePollResult:
-            try:
-                payload = await client.list_dataflows(dataplane_url)
-            except DataPlaneClientError as exc:
-                return DataplanePollResult(dataplane_url=dataplane_url, error=str(exc))
+        all_flows = mqtt_event_store.snapshot()
+        results: list[DataplanePollResult] = []
+        has_single_url = len(urls) == 1
+        for dataplane_url in urls:
+            matching = [
+                flow
+                for flow in all_flows
+                if isinstance(flow.get("dataplaneUrl"), str)
+                and flow.get("dataplaneUrl") == dataplane_url
+            ]
+            if not matching and has_single_url:
+                # Allow single-target setups even when dataplaneUrl is omitted in MQTT payload.
+                matching = [flow for flow in all_flows if flow.get("dataplaneUrl") is None]
+                for flow in matching:
+                    flow["dataplaneUrl"] = dataplane_url
 
-            dataplane_id = payload.get("dataplaneId")
-            raw_data_flows = payload.get("dataFlows")
-            if not isinstance(raw_data_flows, list):
-                return DataplanePollResult(
+            dataplane_id: str | None = None
+            if matching:
+                raw_dataplane_id = matching[0].get("dataplaneId")
+                if isinstance(raw_dataplane_id, str):
+                    dataplane_id = raw_dataplane_id
+
+            results.append(
+                DataplanePollResult(
                     dataplane_url=dataplane_url,
-                    dataplane_id=str(dataplane_id) if dataplane_id is not None else None,
-                    error="Management response missing dataFlows list.",
+                    dataplane_id=dataplane_id,
+                    data_flows=matching,
                 )
-
-            flows: list[dict[str, object]] = []
-            for item in raw_data_flows:
-                if isinstance(item, dict):
-                    flows.append(item)
-
-            return DataplanePollResult(
-                dataplane_url=dataplane_url,
-                dataplane_id=str(dataplane_id) if dataplane_id is not None else None,
-                data_flows=flows,
             )
 
-        results = await asyncio.gather(*(poll_one(url) for url in urls))
         return DataflowQueryResponse(results=results)
 
     @app.post("/api/transfers/{data_flow_id}/pause", status_code=200)

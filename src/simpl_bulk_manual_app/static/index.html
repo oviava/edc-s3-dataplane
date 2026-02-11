@@ -215,6 +215,22 @@
               Destination endpoint URL (optional)
               <input id="destination-endpoint-url" type="text" />
             </label>
+            <label>
+              Source access key ID (optional)
+              <input id="source-access-key-id" type="text" />
+            </label>
+            <label>
+              Source secret access key (optional)
+              <input id="source-secret-access-key" type="password" />
+            </label>
+            <label>
+              Destination access key ID (optional)
+              <input id="destination-access-key-id" type="text" />
+            </label>
+            <label>
+              Destination secret access key (optional)
+              <input id="destination-secret-access-key" type="password" />
+            </label>
             <label class="full">
               Process ID (optional)
               <input id="process-id" type="text" />
@@ -231,7 +247,7 @@
         </section>
 
         <section class="card">
-          <h2>Monitor Dataflows</h2>
+          <h2>Monitor Dataflows (MQTT)</h2>
           <div class="form-grid">
             <label class="full">
               Dataplane URLs (comma separated)
@@ -396,6 +412,14 @@
           sourceEndpointUrl: document.getElementById("source-endpoint-url").value.trim() || null,
           destinationEndpointUrl:
             document.getElementById("destination-endpoint-url").value.trim() || null,
+          sourceAccessKeyId:
+            document.getElementById("source-access-key-id").value.trim() || null,
+          sourceSecretAccessKey:
+            document.getElementById("source-secret-access-key").value.trim() || null,
+          destinationAccessKeyId:
+            document.getElementById("destination-access-key-id").value.trim() || null,
+          destinationSecretAccessKey:
+            document.getElementById("destination-secret-access-key").value.trim() || null,
           processId: document.getElementById("process-id").value.trim() || null,
           autoStartedNotification: document.getElementById("auto-started").checked,
         };

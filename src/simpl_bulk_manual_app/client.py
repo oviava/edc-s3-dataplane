@@ -64,14 +64,6 @@ class DataPlaneClient:
         )
         self._ensure_success(response)
 
-    async def list_dataflows(self, dataplane_url: str) -> dict[str, Any]:
-        """Call `/management/dataflows`."""
-
-        response = await self._http.get(
-            self._endpoint(dataplane_url, "/management/dataflows"),
-        )
-        return self._parse_json_response(response)
-
     def _endpoint(self, base_url: str, path: str) -> str:
         clean_base = base_url.strip().rstrip("/")
         if not clean_base:

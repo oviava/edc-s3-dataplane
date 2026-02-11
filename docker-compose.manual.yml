@@ -1,0 +1,182 @@
+x-app-image: &app-image simpl-bulk-dataplane:manual
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    command: >
+      sh -c "rabbitmq-plugins enable --offline rabbitmq_mqtt && rabbitmq-server"
+    ports:
+      - "1883:1883"
+      - "15672:15672"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "rabbitmq-diagnostics -q ping && rabbitmq-diagnostics -q listeners | grep -q 1883",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres-a:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: simpl_dataplane_a
+      POSTGRES_USER: simpl
+      POSTGRES_PASSWORD: simpl
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U simpl -d simpl_dataplane_a"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres-a-data:/var/lib/postgresql/data
+
+  postgres-b:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: simpl_dataplane_b
+      POSTGRES_USER: simpl
+      POSTGRES_PASSWORD: simpl
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U simpl -d simpl_dataplane_b"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres-b-data:/var/lib/postgresql/data
+
+  minio-a:
+    image: quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+
+  minio-b:
+    image: quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19010:9000"
+      - "19011:9001"
+
+  minio-a-shaper:
+    image: nicolaka/netshoot:latest
+    network_mode: "service:minio-a"
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "tc qdisc replace dev eth0 root tbf rate 40mbit burst 64kb latency 200ms &&
+      tail -f /dev/null"
+    restart: unless-stopped
+    depends_on:
+      minio-a:
+        condition: service_started
+
+  minio-b-shaper:
+    image: nicolaka/netshoot:latest
+    network_mode: "service:minio-b"
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "tc qdisc replace dev eth0 root tbf rate 40mbit burst 64kb latency 200ms &&
+      tail -f /dev/null"
+    restart: unless-stopped
+    depends_on:
+      minio-b:
+        condition: service_started
+
+  dataplane-a:
+    image: *app-image
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      SIMPL_DP_DATAPLANE_ID: dataplane-a
+      SIMPL_DP_DATAPLANE_PUBLIC_URL: http://dataplane-a:8080
+      SIMPL_DP_REPOSITORY_BACKEND: postgres
+      SIMPL_DP_POSTGRES_DSN: postgresql://simpl:simpl@postgres-a:5432/simpl_dataplane_a
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_ENABLED: "true"
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_HOST: rabbitmq
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_PORT: "1883"
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_TOPIC_PREFIX: simpl/dataplane
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_QOS: "0"
+    ports:
+      - "18081:8080"
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres-a:
+        condition: service_healthy
+      minio-a:
+        condition: service_started
+      minio-b:
+        condition: service_started
+      minio-a-shaper:
+        condition: service_started
+      minio-b-shaper:
+        condition: service_started
+
+  dataplane-b:
+    image: *app-image
+    environment:
+      SIMPL_DP_DATAPLANE_ID: dataplane-b
+      SIMPL_DP_DATAPLANE_PUBLIC_URL: http://dataplane-b:8080
+      SIMPL_DP_REPOSITORY_BACKEND: postgres
+      SIMPL_DP_POSTGRES_DSN: postgresql://simpl:simpl@postgres-b:5432/simpl_dataplane_b
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_ENABLED: "true"
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_HOST: rabbitmq
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_PORT: "1883"
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_TOPIC_PREFIX: simpl/dataplane
+      SIMPL_DP_DATAFLOW_EVENTS_MQTT_QOS: "0"
+    ports:
+      - "18082:8080"
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres-b:
+        condition: service_healthy
+      minio-a:
+        condition: service_started
+      minio-b:
+        condition: service_started
+      minio-a-shaper:
+        condition: service_started
+      minio-b-shaper:
+        condition: service_started
+
+  manual-ui:
+    image: *app-image
+    command: uvicorn simpl_bulk_manual_app.main:app --host 0.0.0.0 --port 8090
+    environment:
+      SIMPL_MANUAL_MQTT_ENABLED: "true"
+      SIMPL_MANUAL_MQTT_HOST: rabbitmq
+      SIMPL_MANUAL_MQTT_PORT: "1883"
+      SIMPL_MANUAL_MQTT_TOPIC_PREFIX: simpl/dataplane
+      SIMPL_MANUAL_DP_URLS: http://dataplane-a:8080,http://dataplane-b:8080
+    ports:
+      - "18090:8090"
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      dataplane-a:
+        condition: service_started
+      dataplane-b:
+        condition: service_started
+
+volumes:
+  postgres-a-data:
+  postgres-b-data:

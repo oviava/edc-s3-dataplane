@@ -16,6 +16,7 @@ from simpl_bulk_dataplane.domain.monitoring_models import (
 )
 from simpl_bulk_dataplane.domain.ports import (
     ControlPlaneNotifier,
+    DataFlowEventPublisher,
     DataFlowRepository,
     TransferExecutor,
 )
@@ -34,6 +35,7 @@ from simpl_bulk_dataplane.domain.transfer_types import DataFlowState, TransferMo
 
 __all__ = [
     "ControlPlaneNotifier",
+    "DataFlowEventPublisher",
     "DataAddress",
     "DataFlow",
     "DataFlowConflictError",
