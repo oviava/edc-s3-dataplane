@@ -54,6 +54,7 @@ class FakeDataPlaneClient:
 class FakeMqttDataFlowEventStore:
     def __init__(self, *_: object, **__: object) -> None:
         self.closed = False
+        self._revision = 1
         self._flows = [
             {
                 "dataplaneId": "dp-test",
@@ -84,6 +85,9 @@ class FakeMqttDataFlowEventStore:
 
     def snapshot(self) -> list[dict[str, object]]:
         return self._flows
+
+    def snapshot_with_revision(self) -> tuple[int, list[dict[str, object]]]:
+        return self._revision, self._flows
 
 
 def test_manual_ui_start_push_and_start_existing_replays_start(monkeypatch: Any) -> None:
@@ -241,3 +245,39 @@ def test_manual_ui_query_requires_mqtt_when_disabled(monkeypatch: Any) -> None:
 
     assert response.status_code == 400
     assert "MQTT monitoring is not enabled" in response.json()["detail"]
+
+
+def test_manual_ui_stream_dataflows_over_websocket(monkeypatch: Any) -> None:
+    monkeypatch.setattr("simpl_bulk_manual_app.main.DataPlaneClient", FakeDataPlaneClient)
+    monkeypatch.setattr("simpl_bulk_manual_app.main._mqtt_enabled", lambda: True)
+    monkeypatch.setenv("SIMPL_MANUAL_MQTT_HOST", "localhost")
+    monkeypatch.setattr(
+        "simpl_bulk_manual_app.main.MqttDataFlowEventStore",
+        FakeMqttDataFlowEventStore,
+    )
+    app = create_app()
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/dataflows?dataplaneUrls=http://dp-a:8080",
+        ) as websocket:
+            payload = websocket.receive_json()
+
+    assert payload["type"] == "snapshot"
+    assert payload["revision"] == 1
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["dataplaneUrl"] == "http://dp-a:8080"
+    assert len(payload["results"][0]["dataFlows"]) == 1
+
+
+def test_manual_ui_stream_requires_mqtt_when_disabled(monkeypatch: Any) -> None:
+    monkeypatch.setattr("simpl_bulk_manual_app.main.DataPlaneClient", FakeDataPlaneClient)
+    monkeypatch.setattr("simpl_bulk_manual_app.main._mqtt_enabled", lambda: False)
+    app = create_app()
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/dataflows") as websocket:
+            payload = websocket.receive_json()
+
+    assert payload["type"] == "error"
+    assert "MQTT monitoring is not enabled" in payload["detail"]

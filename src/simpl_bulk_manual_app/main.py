@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -10,8 +11,9 @@ from typing import Any
 from uuid import uuid4
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from simpl_bulk_dataplane.domain.transfer_types import TransferMode
 from simpl_bulk_manual_app.client import DataPlaneClient, DataPlaneClientError
@@ -61,6 +63,15 @@ def _default_dataplane_urls() -> list[str]:
         if value not in deduped:
             deduped.append(value)
     return deduped
+
+
+def _normalize_dataplane_urls(values: list[str]) -> list[str]:
+    urls: list[str] = []
+    for value in values:
+        normalized = _normalize_dataplane_url(value)
+        if normalized not in urls:
+            urls.append(normalized)
+    return urls
 
 
 def _mqtt_enabled() -> bool:
@@ -171,6 +182,42 @@ def _build_start_payload(request: StartTransferRequest, process_id: str) -> dict
     return payload
 
 
+def _dataflow_results_for_urls(
+    *,
+    all_flows: list[dict[str, object]],
+    dataplane_urls: list[str],
+) -> list[DataplanePollResult]:
+    results: list[DataplanePollResult] = []
+    has_single_url = len(dataplane_urls) == 1
+    for dataplane_url in dataplane_urls:
+        matching = [
+            flow
+            for flow in all_flows
+            if isinstance(flow.get("dataplaneUrl"), str)
+            and flow.get("dataplaneUrl") == dataplane_url
+        ]
+        if not matching and has_single_url:
+            # Allow single-target setups even when dataplaneUrl is omitted in MQTT payload.
+            matching = [flow for flow in all_flows if flow.get("dataplaneUrl") is None]
+            for flow in matching:
+                flow["dataplaneUrl"] = dataplane_url
+
+        dataplane_id: str | None = None
+        if matching:
+            raw_dataplane_id = matching[0].get("dataplaneId")
+            if isinstance(raw_dataplane_id, str):
+                dataplane_id = raw_dataplane_id
+
+        results.append(
+            DataplanePollResult(
+                dataplane_url=dataplane_url,
+                dataplane_id=dataplane_id,
+                data_flows=matching,
+            )
+        )
+    return results
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     app.state.dataplane_client = DataPlaneClient()
@@ -204,7 +251,9 @@ def create_app() -> FastAPI:
     """Create manual UI FastAPI app."""
 
     app = FastAPI(title="Simpl Bulk Manual E2E UI", version="0.1.0", lifespan=_lifespan)
-    static_index = Path(__file__).resolve().parent / "static" / "index.html"
+    static_dir = Path(__file__).resolve().parent / "static"
+    static_index = static_dir / "index.html"
+    app.mount("/static", StaticFiles(directory=static_dir), name="manual-ui-static")
 
     @app.get("/")
     async def index() -> FileResponse:
@@ -285,43 +334,60 @@ def create_app() -> FastAPI:
                 ),
             )
 
-        urls: list[str] = []
-        for value in body.dataplane_urls:
-            normalized = _normalize_dataplane_url(value)
-            if normalized not in urls:
-                urls.append(normalized)
-
+        urls = _normalize_dataplane_urls(body.dataplane_urls)
         all_flows = mqtt_event_store.snapshot()
-        results: list[DataplanePollResult] = []
-        has_single_url = len(urls) == 1
-        for dataplane_url in urls:
-            matching = [
-                flow
-                for flow in all_flows
-                if isinstance(flow.get("dataplaneUrl"), str)
-                and flow.get("dataplaneUrl") == dataplane_url
-            ]
-            if not matching and has_single_url:
-                # Allow single-target setups even when dataplaneUrl is omitted in MQTT payload.
-                matching = [flow for flow in all_flows if flow.get("dataplaneUrl") is None]
-                for flow in matching:
-                    flow["dataplaneUrl"] = dataplane_url
-
-            dataplane_id: str | None = None
-            if matching:
-                raw_dataplane_id = matching[0].get("dataplaneId")
-                if isinstance(raw_dataplane_id, str):
-                    dataplane_id = raw_dataplane_id
-
-            results.append(
-                DataplanePollResult(
-                    dataplane_url=dataplane_url,
-                    dataplane_id=dataplane_id,
-                    data_flows=matching,
-                )
-            )
-
+        results = _dataflow_results_for_urls(all_flows=all_flows, dataplane_urls=urls)
         return DataflowQueryResponse(results=results)
+
+    @app.websocket("/ws/dataflows")
+    async def stream_dataflows(websocket: WebSocket) -> None:
+        await websocket.accept()
+        mqtt_event_store: MqttDataFlowEventStore | None = websocket.app.state.mqtt_event_store
+        if mqtt_event_store is None:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "detail": (
+                        "MQTT monitoring is not enabled. Configure "
+                        "SIMPL_MANUAL_MQTT_ENABLED=true and MQTT connection settings."
+                    ),
+                }
+            )
+            await websocket.close(code=1013)
+            return
+
+        raw_urls = websocket.query_params.get("dataplaneUrls", "")
+        candidate_urls = [value.strip() for value in raw_urls.split(",") if value.strip()]
+        if not candidate_urls:
+            candidate_urls = list(websocket.app.state.default_dataplane_urls)
+
+        try:
+            dataplane_urls = _normalize_dataplane_urls(candidate_urls)
+        except ValueError as exc:
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+            await websocket.close(code=1008)
+            return
+
+        last_revision = -1
+        try:
+            while True:
+                revision, all_flows = mqtt_event_store.snapshot_with_revision()
+                if revision != last_revision:
+                    results = _dataflow_results_for_urls(
+                        all_flows=all_flows,
+                        dataplane_urls=dataplane_urls,
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "snapshot",
+                            "revision": revision,
+                            "results": [result.model_dump(by_alias=True) for result in results],
+                        }
+                    )
+                    last_revision = revision
+                await asyncio.sleep(0.5)
+        except (WebSocketDisconnect, RuntimeError):
+            return
 
     @app.post("/api/transfers/{data_flow_id}/pause", status_code=200)
     async def pause_transfer(

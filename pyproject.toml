@@ -38,7 +38,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-simpl_bulk_manual_app = ["static/*.html"]
+simpl_bulk_manual_app = ["static/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

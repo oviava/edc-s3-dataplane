@@ -14,7 +14,8 @@ src/simpl_bulk_dataplane/
 src/simpl_bulk_manual_app/
   main.py            # Separate manual E2E UI app
   client.py          # Dataplane API client for the manual UI
-  static/index.html  # Browser UI
+  static/            # Served UI assets (React bundle + index)
+  frontend/          # React + TypeScript source and build config
 tests/               # Service and API smoke tests
 ```
 
@@ -33,6 +34,14 @@ Run the separate manual E2E UI app:
 SIMPL_MANUAL_MQTT_ENABLED=true \
 SIMPL_MANUAL_MQTT_HOST=localhost \
 uvicorn simpl_bulk_manual_app.main:app --reload --port 8090
+```
+
+Rebuild manual UI frontend assets after UI changes:
+
+```bash
+cd src/simpl_bulk_manual_app/frontend
+npm install
+npm run build
 ```
 
 Or via console scripts:
@@ -135,6 +144,9 @@ SIMPL_MANUAL_MQTT_TOPIC_PREFIX=simpl/dataplane
 SIMPL_MANUAL_MQTT_USERNAME=guest
 SIMPL_MANUAL_MQTT_PASSWORD=guest
 ```
+
+Manual UI live stream endpoint:
+- `GET /ws/dataflows?dataplaneUrls=http://dp-a:8080,http://dp-b:8080` (WebSocket)
 
 ## Notes
 

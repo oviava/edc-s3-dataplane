@@ -32,6 +32,7 @@ class MqttDataFlowEventStore:
 
         self._lock = threading.Lock()
         self._flows: dict[tuple[str, str], dict[str, object]] = {}
+        self._revision = 0
 
         try:
             client = mqtt.Client(
@@ -64,6 +65,12 @@ class MqttDataFlowEventStore:
 
         with self._lock:
             return [deepcopy(value) for value in self._flows.values()]
+
+    def snapshot_with_revision(self) -> tuple[int, list[dict[str, object]]]:
+        """Return snapshots with a revision for change tracking."""
+
+        with self._lock:
+            return self._revision, [deepcopy(value) for value in self._flows.values()]
 
     def _on_message(
         self,
@@ -140,6 +147,7 @@ class MqttDataFlowEventStore:
                 current["updatedAt"] = payload["timestamp"]
 
             self._flows[key] = current
+            self._revision += 1
 
     def _connect_with_retry(
         self,
