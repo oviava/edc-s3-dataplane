@@ -34,6 +34,7 @@ class FakeS3Client:
         self.uploaded_part_numbers: list[int] = []
         self.complete_calls = 0
         self.abort_calls = 0
+        self.list_calls = 0
 
     def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
         return {"ContentLength": len(self._objects[(Bucket, Key)])}
@@ -65,6 +66,33 @@ class FakeS3Client:
             self.put_calls += 1
             self._objects[(Bucket, Key)] = Body
         return {"ETag": "etag-single-part"}
+
+    def list_objects_v2(
+        self,
+        *,
+        Bucket: str,
+        ContinuationToken: str | None = None,
+    ) -> dict[str, Any]:
+        page_size = 2
+        with self._lock:
+            self.list_calls += 1
+            keys = sorted(key for bucket, key in self._objects if bucket == Bucket)
+
+        start = 0 if ContinuationToken is None else int(ContinuationToken)
+        page = keys[start : start + page_size]
+        contents = [
+            {"Key": key, "Size": len(self._objects[(Bucket, key)])}
+            for key in page
+        ]
+        next_index = start + page_size
+        is_truncated = next_index < len(keys)
+        response: dict[str, Any] = {
+            "Contents": contents,
+            "IsTruncated": is_truncated,
+        }
+        if is_truncated:
+            response["NextContinuationToken"] = str(next_index)
+        return response
 
     def create_multipart_upload(self, *, Bucket: str, Key: str) -> dict[str, Any]:
         with self._lock:
@@ -297,3 +325,113 @@ def test_start_uses_dataaddress_credentials_for_s3_clients() -> None:
     assert destination_call[2] is True
     assert destination_call[3] == "dst-ak"
     assert destination_call[4] == "dst-sk"
+
+
+def test_bucket_to_bucket_without_source_key_supports_suspend_resume() -> None:
+    fake_client = FakeS3Client(
+        {
+            ("src-bucket", "0-large.bin"): 16 * 1024 * 1024,
+            ("src-bucket", "1-small.txt"): 512 * 1024,
+            ("src-bucket", "2-small.txt"): 256 * 1024,
+        },
+        part_delay_seconds=0.05,
+    )
+    executor = S3TransferExecutor(
+        multipart_threshold_mb=5,
+        multipart_part_size_mb=5,
+        s3_client_factory=lambda *_: fake_client,
+    )
+
+    data_flow = _build_data_flow("bucket-resume")
+    data_flow.metadata = {
+        "sourceBucket": "src-bucket",
+        "destinationBucket": "dst-bucket",
+    }
+    message = _build_start_message("bucket-resume").model_copy(
+        update={
+            "metadata": {
+                "sourceBucket": "src-bucket",
+                "destinationBucket": "dst-bucket",
+            },
+            "data_address": DataAddress(
+                type_="DataAddress",
+                endpoint_type="urn:aws:s3",
+                endpoint="s3://dst-bucket",
+                endpoint_properties=[],
+            ),
+        }
+    )
+
+    async def scenario() -> None:
+        await executor.start(data_flow, message)
+        await asyncio.sleep(0.01)
+        await executor.suspend(data_flow, "pause")
+
+        await asyncio.sleep(0.08)
+        count_during_pause = len(fake_client.uploaded_part_numbers)
+        await asyncio.sleep(0.08)
+        assert len(fake_client.uploaded_part_numbers) == count_during_pause
+
+        await executor.start(data_flow, message)
+        await executor.complete(data_flow)
+
+    asyncio.run(scenario())
+
+    assert fake_client.list_calls >= 1
+    assert fake_client.complete_calls == 1
+    assert fake_client._objects[("dst-bucket", "0-large.bin")] == fake_client._objects[
+        ("src-bucket", "0-large.bin")
+    ]
+    assert fake_client._objects[("dst-bucket", "1-small.txt")] == fake_client._objects[
+        ("src-bucket", "1-small.txt")
+    ]
+    assert fake_client._objects[("dst-bucket", "2-small.txt")] == fake_client._objects[
+        ("src-bucket", "2-small.txt")
+    ]
+
+
+def test_bucket_to_bucket_uses_destination_key_prefix() -> None:
+    fake_client = FakeS3Client(
+        {
+            ("src-bucket", "a/file-1.txt"): 64 * 1024,
+            ("src-bucket", "b/file-2.txt"): 32 * 1024,
+        }
+    )
+    executor = S3TransferExecutor(
+        multipart_threshold_mb=5,
+        multipart_part_size_mb=5,
+        s3_client_factory=lambda *_: fake_client,
+    )
+
+    data_flow = _build_data_flow("bucket-prefix")
+    data_flow.metadata = {
+        "sourceBucket": "src-bucket",
+        "destinationBucket": "dst-bucket",
+    }
+    message = _build_start_message("bucket-prefix").model_copy(
+        update={
+            "metadata": {
+                "sourceBucket": "src-bucket",
+                "destinationBucket": "dst-bucket",
+            },
+            "data_address": DataAddress(
+                type_="DataAddress",
+                endpoint_type="urn:aws:s3",
+                endpoint="s3://dst-bucket/archive",
+                endpoint_properties=[],
+            ),
+        }
+    )
+
+    async def scenario() -> None:
+        await executor.start(data_flow, message)
+        await executor.complete(data_flow)
+
+    asyncio.run(scenario())
+
+    assert fake_client._objects[("dst-bucket", "archive/a/file-1.txt")] == fake_client._objects[
+        ("src-bucket", "a/file-1.txt")
+    ]
+    assert fake_client._objects[("dst-bucket", "archive/b/file-2.txt")] == fake_client._objects[
+        ("src-bucket", "b/file-2.txt")
+    ]

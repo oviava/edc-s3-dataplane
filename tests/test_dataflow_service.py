@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from simpl_bulk_dataplane.application.services import DataFlowService
-from simpl_bulk_dataplane.domain.errors import DataFlowValidationError
+from simpl_bulk_dataplane.domain.errors import DataFlowConflictError, DataFlowValidationError
 from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
 from simpl_bulk_dataplane.domain.ports import TransferExecutor
 from simpl_bulk_dataplane.domain.signaling_models import (
@@ -129,6 +129,36 @@ class RecordingTransferExecutor(TransferExecutor):
         return None
 
 
+class FailingProgressTransferExecutor(RecordingTransferExecutor):
+    """Test double that reports runtime transfer failure via progress."""
+
+    def __init__(self, error_message: str) -> None:
+        super().__init__()
+        self._error_message = error_message
+        self._progress_by_flow: dict[str, TransferProgressSnapshot] = {}
+
+    async def start(
+        self,
+        data_flow: object,
+        message: DataFlowStartMessage,
+    ) -> DataAddress | None:
+        assert hasattr(data_flow, "data_flow_id")
+        self.start_messages.append(message)
+        flow_id = str(getattr(data_flow, "data_flow_id"))
+        self._progress_by_flow[flow_id] = TransferProgressSnapshot(
+            bytes_total=None,
+            bytes_transferred=0,
+            running=False,
+            paused=False,
+            finished=False,
+            last_error=self._error_message,
+        )
+        return None
+
+    async def get_progress(self, data_flow_id: str) -> TransferProgressSnapshot | None:
+        return self._progress_by_flow.get(data_flow_id)
+
+
 def test_start_can_resume_push_without_repeating_data_address() -> None:
     transfer_executor = RecordingTransferExecutor()
     service = DataFlowService(
@@ -184,3 +214,49 @@ def test_start_can_resume_push_without_repeating_data_address() -> None:
     assert len(transfer_executor.start_messages) == 2
     assert transfer_executor.start_messages[1].data_address is not None
     assert transfer_executor.start_messages[1].data_address.endpoint == "s3://dst-bucket/result.csv"
+
+
+def test_runtime_failure_reconciles_started_flow_to_terminated() -> None:
+    transfer_executor = FailingProgressTransferExecutor("Invalid endpoint: http")
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=transfer_executor,
+        control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+    )
+
+    started_result = asyncio.run(service.start(start_message("proc-runtime-error")))
+    assert started_result.status_code == 200
+    assert started_result.body is not None
+    assert started_result.body.state is DataFlowState.STARTED
+    flow_id = started_result.body.data_flow_id
+
+    flow_info = asyncio.run(service.get_data_flow_info(flow_id))
+    assert flow_info.state is DataFlowState.TERMINATED
+    assert flow_info.progress.last_error == "Invalid endpoint: http"
+
+    status = asyncio.run(service.get_status(flow_id))
+    assert status.state is DataFlowState.TERMINATED
+
+
+def test_start_rejects_resume_when_runtime_error_already_terminated_flow() -> None:
+    transfer_executor = FailingProgressTransferExecutor("Invalid endpoint: http")
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=transfer_executor,
+        control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+    )
+
+    initial_result = asyncio.run(service.start(start_message("proc-runtime-error-restart")))
+    assert initial_result.body is not None
+    flow_id = initial_result.body.data_flow_id
+
+    # Trigger reconciliation before attempting a second start.
+    status = asyncio.run(service.get_status(flow_id))
+    assert status.state is DataFlowState.TERMINATED
+
+    with pytest.raises(DataFlowConflictError):
+        asyncio.run(service.start(start_message("proc-runtime-error-restart")))

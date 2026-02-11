@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from simpl_bulk_dataplane.domain.transfer_types import TransferMode
 
@@ -19,9 +19,9 @@ class StartTransferRequest(UiModel):
     dataplane_url: str = Field(alias="dataplaneUrl")
     transfer_mode: TransferMode = Field(alias="transferMode")
     source_bucket: str = Field(alias="sourceBucket")
-    source_key: str = Field(alias="sourceKey")
+    source_key: str | None = Field(default=None, alias="sourceKey")
     destination_bucket: str = Field(alias="destinationBucket")
-    destination_key: str = Field(alias="destinationKey")
+    destination_key: str | None = Field(default=None, alias="destinationKey")
     source_endpoint_url: str | None = Field(default=None, alias="sourceEndpointUrl")
     destination_endpoint_url: str | None = Field(default=None, alias="destinationEndpointUrl")
     source_access_key_id: str | None = Field(default=None, alias="sourceAccessKeyId")
@@ -32,6 +32,16 @@ class StartTransferRequest(UiModel):
     )
     process_id: str | None = Field(default=None, alias="processId")
     auto_started_notification: bool = Field(default=True, alias="autoStartedNotification")
+
+    @field_validator("source_key", "destination_key", mode="before")
+    @classmethod
+    def normalize_optional_keys(cls, value: object) -> str | None:
+        """Treat empty key inputs as omitted."""
+
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     @model_validator(mode="after")
     def validate_s3_credential_pairs(self) -> StartTransferRequest:

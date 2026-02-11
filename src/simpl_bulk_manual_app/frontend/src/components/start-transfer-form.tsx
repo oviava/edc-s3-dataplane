@@ -24,6 +24,8 @@ export function StartTransferForm({
   onFieldChange,
   onSubmit,
 }: StartTransferFormProps): JSX.Element {
+  const sourceKeyPresent = startForm.sourceKey.trim().length > 0;
+
   return (
     <Card>
       <CardHeader>
@@ -81,13 +83,14 @@ export function StartTransferForm({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="start-source-key">Source key (file)</Label>
+              <Label htmlFor="start-source-key">Source key (optional file)</Label>
               <Input
                 id="start-source-key"
-                required
+                placeholder="Leave empty to transfer full source bucket"
                 value={startForm.sourceKey}
                 onChange={(event) => onFieldChange("sourceKey", event.target.value)}
               />
+              <p className="text-xs text-slate-500">Leave empty to copy all objects from the source bucket.</p>
             </div>
 
             <div className="space-y-2">
@@ -101,13 +104,17 @@ export function StartTransferForm({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="start-destination-key">Destination key (file)</Label>
+              <Label htmlFor="start-destination-key">Destination key/prefix (optional)</Label>
               <Input
                 id="start-destination-key"
-                required
+                placeholder="Optional file key or prefix"
+                disabled={!sourceKeyPresent}
                 value={startForm.destinationKey}
                 onChange={(event) => onFieldChange("destinationKey", event.target.value)}
               />
+              <p className="text-xs text-slate-500">
+                Enabled only when source key is set. Leave empty to preserve source key/path.
+              </p>
             </div>
 
             <div className="space-y-2">

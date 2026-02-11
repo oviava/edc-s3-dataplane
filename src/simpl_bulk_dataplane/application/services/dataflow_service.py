@@ -110,6 +110,8 @@ class DataFlowService:
         transfer_mode = parse_transfer_mode(message.transfer_type)
 
         existing = await self._repository.get_by_process_id(message.process_id)
+        if existing is not None:
+            existing = await self._reconcile_runtime_failure(existing)
         if existing is None:
             data_flow = self._new_data_flow(message, transfer_mode)
         elif existing.state in TERMINAL_STATES:
@@ -173,6 +175,12 @@ class DataFlowService:
         """Handle `/dataflows/{id}/started` for consumer-side transitions."""
 
         data_flow = await self._get_data_flow_or_raise(data_flow_id)
+        data_flow = await self._reconcile_runtime_failure(data_flow)
+        if data_flow.state in TERMINAL_STATES:
+            raise DataFlowConflictError(
+                f"Cannot mark data flow '{data_flow.data_flow_id}' as started in "
+                f"state '{data_flow.state}'."
+            )
         effective_message = message
         if (
             data_flow.transfer_mode is TransferMode.PULL
@@ -198,6 +206,7 @@ class DataFlowService:
         """Handle `/dataflows/{id}/suspend`."""
 
         data_flow = await self._get_data_flow_or_raise(data_flow_id)
+        data_flow = await self._reconcile_runtime_failure(data_flow)
         if data_flow.state != DataFlowState.STARTED:
             raise DataFlowValidationError(
                 f"Suspend is only allowed in STARTED state, got '{data_flow.state}'."
@@ -212,6 +221,7 @@ class DataFlowService:
         """Handle `/dataflows/{id}/terminate`."""
 
         data_flow = await self._get_data_flow_or_raise(data_flow_id)
+        data_flow = await self._reconcile_runtime_failure(data_flow)
         if data_flow.state == DataFlowState.TERMINATED:
             return
 
@@ -226,6 +236,7 @@ class DataFlowService:
         """Handle `/dataflows/{id}/completed`."""
 
         data_flow = await self._get_data_flow_or_raise(data_flow_id)
+        data_flow = await self._reconcile_runtime_failure(data_flow)
         if data_flow.state == DataFlowState.COMPLETED:
             return
 
@@ -240,6 +251,7 @@ class DataFlowService:
         """Handle `/dataflows/{id}/status`."""
 
         data_flow = await self._get_data_flow_or_raise(data_flow_id)
+        data_flow = await self._reconcile_runtime_failure(data_flow)
         return DataFlowStatusResponseMessage(
             data_flow_id=data_flow.data_flow_id,
             state=data_flow.state,
@@ -252,6 +264,7 @@ class DataFlowService:
         """List flows with progress details for management UIs."""
 
         data_flows = await self._repository.list_data_flows()
+        data_flows = [await self._reconcile_runtime_failure(flow) for flow in data_flows]
         if transfer_mode is not None:
             data_flows = [flow for flow in data_flows if flow.transfer_mode is transfer_mode]
 
@@ -265,6 +278,7 @@ class DataFlowService:
         """Fetch one flow with progress details for management UIs."""
 
         data_flow = await self._get_data_flow_or_raise(data_flow_id)
+        data_flow = await self._reconcile_runtime_failure(data_flow)
         return await self._to_data_flow_info(data_flow)
 
     def _new_data_flow(self, message: DataFlowBaseMessage, transfer_mode: TransferMode) -> DataFlow:
@@ -452,6 +466,27 @@ class DataFlowService:
         progress = await self._transfer_executor.get_progress(data_flow.data_flow_id)
         with suppress(Exception):
             await self._dataflow_event_publisher.publish_state(data_flow, progress)
+
+    async def _reconcile_runtime_failure(self, data_flow: DataFlow) -> DataFlow:
+        """Promote failed runtime sessions to TERMINATED when executor reports errors."""
+
+        if data_flow.state in TERMINAL_STATES:
+            return data_flow
+
+        snapshot = await self._transfer_executor.get_progress(data_flow.data_flow_id)
+        if snapshot is None:
+            return data_flow
+
+        error = snapshot.last_error
+        if error is None or not error.strip():
+            return data_flow
+
+        data_flow.state = DataFlowState.TERMINATED
+        await self._repository.upsert(data_flow)
+        response = self._response_message(data_flow, error=error)
+        await self._control_plane_notifier.notify_terminated(data_flow, response)
+        await self._publish_state_event(data_flow)
+        return data_flow
 
 
 __all__ = ["CommandResult", "DataFlowService"]

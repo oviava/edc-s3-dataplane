@@ -240,7 +240,16 @@ export function useDataflowDashboard(): UseDataflowDashboardResult {
 
   const updateStartFormField = useCallback(
     <K extends keyof StartFormState>(field: K, value: StartFormState[K]) => {
-      setStartForm((previous) => ({ ...previous, [field]: value }));
+      setStartForm((previous) => {
+        if (field === "sourceKey") {
+          const nextSourceKey = String(value);
+          if (nextSourceKey.trim().length === 0) {
+            return { ...previous, sourceKey: nextSourceKey, destinationKey: "" };
+          }
+          return { ...previous, sourceKey: nextSourceKey };
+        }
+        return { ...previous, [field]: value };
+      });
     },
     [],
   );
@@ -250,13 +259,15 @@ export function useDataflowDashboard(): UseDataflowDashboardResult {
       event.preventDefault();
 
       try {
+        const sourceKey = optionalValue(startForm.sourceKey);
+        const destinationKey = sourceKey === null ? null : optionalValue(startForm.destinationKey);
         const payload = {
           dataplaneUrl: startForm.dataplaneUrl.trim(),
           transferMode: startForm.transferMode,
           sourceBucket: startForm.sourceBucket.trim(),
-          sourceKey: startForm.sourceKey.trim(),
+          sourceKey,
           destinationBucket: startForm.destinationBucket.trim(),
-          destinationKey: startForm.destinationKey.trim(),
+          destinationKey,
           sourceEndpointUrl: optionalValue(startForm.sourceEndpointUrl),
           destinationEndpointUrl: optionalValue(startForm.destinationEndpointUrl),
           sourceAccessKeyId: optionalValue(startForm.sourceAccessKeyId),

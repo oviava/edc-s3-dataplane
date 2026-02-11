@@ -156,6 +156,8 @@ Manual UI live stream endpoint:
   - `start`/`notify_started` trigger background S3 copy tasks.
   - `suspend` pauses execution and a subsequent `start` resumes.
   - multipart copy is used for large objects or `forceMultipart=true`.
+  - Omitting `sourceKey` copies all objects in `sourceBucket` (bucket-to-bucket mode).
+  - In bucket mode, `destinationKey` is optional and acts as a destination prefix when set.
 - Useful metadata keys for S3 execution:
   - `sourceBucket`, `sourceKey`, `destinationBucket`, `destinationKey`
   - `sourceDataAddress`, `destinationDataAddress` (DataAddress-shaped objects)

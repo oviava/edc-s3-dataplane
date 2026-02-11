@@ -82,7 +82,7 @@ def _mqtt_enabled() -> bool:
 def _build_s3_data_address(
     *,
     bucket: str,
-    key: str,
+    key: str | None,
     endpoint_url: str | None = None,
     access_key_id: str | None = None,
     secret_access_key: str | None = None,
@@ -97,10 +97,11 @@ def _build_s3_data_address(
     if secret_access_key:
         endpoint_properties.append({"name": "secretAccessKey", "value": secret_access_key})
 
+    endpoint = f"s3://{bucket}" if key is None else f"s3://{bucket}/{key}"
     return {
         "@type": "DataAddress",
         "endpointType": "urn:aws:s3",
-        "endpoint": f"s3://{bucket}/{key}",
+        "endpoint": endpoint,
         "endpointProperties": endpoint_properties,
     }
 
@@ -108,7 +109,7 @@ def _build_s3_data_address(
 def _build_optional_metadata_data_address(
     *,
     bucket: str,
-    key: str,
+    key: str | None,
     endpoint_url: str | None = None,
     access_key_id: str | None = None,
     secret_access_key: str | None = None,
@@ -128,19 +129,23 @@ def _build_optional_metadata_data_address(
 
 def _build_start_payload(request: StartTransferRequest, process_id: str) -> dict[str, Any]:
     transfer_type = f"com.test.s3-{request.transfer_mode.value}"
+    source_key = request.source_key
+    destination_key = request.destination_key
     metadata: dict[str, Any] = {
         "sourceBucket": request.source_bucket,
-        "sourceKey": request.source_key,
         "destinationBucket": request.destination_bucket,
-        "destinationKey": request.destination_key,
     }
+    if source_key is not None:
+        metadata["sourceKey"] = source_key
+    if destination_key is not None:
+        metadata["destinationKey"] = destination_key
     if request.source_endpoint_url:
         metadata["sourceEndpointUrl"] = request.source_endpoint_url
     if request.destination_endpoint_url:
         metadata["destinationEndpointUrl"] = request.destination_endpoint_url
     source_data_address = _build_optional_metadata_data_address(
         bucket=request.source_bucket,
-        key=request.source_key,
+        key=source_key,
         endpoint_url=request.source_endpoint_url,
         access_key_id=request.source_access_key_id,
         secret_access_key=request.source_secret_access_key,
@@ -149,7 +154,7 @@ def _build_start_payload(request: StartTransferRequest, process_id: str) -> dict
         metadata["sourceDataAddress"] = source_data_address
     destination_data_address = _build_optional_metadata_data_address(
         bucket=request.destination_bucket,
-        key=request.destination_key,
+        key=destination_key,
         endpoint_url=request.destination_endpoint_url,
         access_key_id=request.destination_access_key_id,
         secret_access_key=request.destination_secret_access_key,
@@ -174,7 +179,7 @@ def _build_start_payload(request: StartTransferRequest, process_id: str) -> dict
     if request.transfer_mode is TransferMode.PUSH:
         payload["dataAddress"] = _build_s3_data_address(
             bucket=request.destination_bucket,
-            key=request.destination_key,
+            key=destination_key,
             endpoint_url=request.destination_endpoint_url,
             access_key_id=request.destination_access_key_id,
             secret_access_key=request.destination_secret_access_key,

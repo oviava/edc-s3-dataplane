@@ -46,6 +46,14 @@ class S3Client(Protocol):
     ) -> dict[str, Any]:
         """Fetch an object or byte range."""
 
+    def list_objects_v2(
+        self,
+        *,
+        Bucket: str,
+        ContinuationToken: str | None = None,
+    ) -> dict[str, Any]:
+        """List objects in a bucket."""
+
     def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> dict[str, Any]:
         """Upload an object in a single call."""
 
@@ -82,7 +90,7 @@ class S3ObjectRef:
     """Canonical S3 object location."""
 
     bucket: str
-    key: str
+    key: str | None
     region: str | None = None
     endpoint_url: str | None = None
     force_path_style: bool = False
@@ -103,6 +111,15 @@ class S3TransferPlan:
     force_multipart: bool
 
 
+@dataclass(slots=True, frozen=True)
+class S3CopyWorkItem:
+    """One source object copy step resolved from transfer plan."""
+
+    source_key: str
+    destination_key: str
+    size_bytes: int
+
+
 @dataclass(slots=True)
 class TransferSession:
     """Runtime state for one background S3 transfer."""
@@ -118,6 +135,11 @@ class TransferSession:
     uploaded_part_sizes: dict[int, int] = field(default_factory=dict)
     object_size_bytes: int | None = None
     bytes_transferred: int = 0
+    completed_bytes: int = 0
+    completed_source_keys: set[str] = field(default_factory=set)
+    active_source_key: str | None = None
+    active_destination_key: str | None = None
+    active_object_size_bytes: int | None = None
     finished: bool = False
     last_error: str | None = None
 
@@ -333,7 +355,7 @@ class S3TransferExecutor(TransferExecutor):
                 )
 
     async def _execute_plan(self, session: TransferSession) -> None:
-        """Run copy workflow using multipart when object size requires it."""
+        """Run copy workflow for one object or all objects in a source bucket."""
 
         source_client = self._s3_client_factory(
             session.plan.source.region or self._default_region,
@@ -352,42 +374,104 @@ class S3TransferExecutor(TransferExecutor):
             session.plan.destination.session_token,
         )
 
-        size = await self._get_source_size(source_client, session.plan.source)
-        session.object_size_bytes = size
+        work_items = await self._build_copy_work_items(source_client, session.plan)
+        session.object_size_bytes = sum(item.size_bytes for item in work_items)
+        size_by_source_key = {item.source_key: item.size_bytes for item in work_items}
+        session.completed_bytes = sum(
+            size_by_source_key.get(source_key, 0) for source_key in session.completed_source_keys
+        )
+        session.bytes_transferred = session.completed_bytes + sum(session.uploaded_part_sizes.values())
+        await self._emit_progress(session.data_flow_id, self._snapshot_from_session(session))
+
+        for item in work_items:
+            if item.source_key in session.completed_source_keys:
+                continue
+            await self._wait_until_active(session)
+            source = self._with_key(session.plan.source, item.source_key)
+            destination = self._with_key(session.plan.destination, item.destination_key)
+            await self._copy_object(
+                source_client=source_client,
+                destination_client=destination_client,
+                session=session,
+                source=source,
+                destination=destination,
+                size=item.size_bytes,
+            )
+
+    async def _copy_object(
+        self,
+        source_client: S3Client,
+        destination_client: S3Client,
+        session: TransferSession,
+        source: S3ObjectRef,
+        destination: S3ObjectRef,
+        size: int,
+    ) -> None:
+        """Copy one object and update aggregate transfer tracking."""
+
+        if source.key is None or destination.key is None:
+            raise RuntimeError("Internal transfer plan resolved object without key.")
+
+        self._prepare_active_object_state(
+            session=session,
+            source_key=source.key,
+            destination_key=destination.key,
+            size=size,
+        )
+
         use_multipart = (
             session.plan.force_multipart
             or size >= session.plan.multipart_threshold_bytes
             or size > session.plan.multipart_part_size_bytes
         )
-
         if not use_multipart:
-            await self._copy_singlepart(source_client, destination_client, session)
+            await self._copy_singlepart(
+                source_client=source_client,
+                destination_client=destination_client,
+                session=session,
+                source=source,
+                destination=destination,
+            )
+            self._mark_object_completed(session, source_key=source.key, size=size)
             return
 
-        await self._copy_multipart(source_client, destination_client, session, size)
+        await self._copy_multipart(
+            source_client=source_client,
+            destination_client=destination_client,
+            session=session,
+            source=source,
+            destination=destination,
+            size=size,
+        )
+        self._mark_object_completed(session, source_key=source.key, size=size)
 
     async def _copy_singlepart(
         self,
         source_client: S3Client,
         destination_client: S3Client,
         session: TransferSession,
+        source: S3ObjectRef,
+        destination: S3ObjectRef,
     ) -> None:
         """Copy object using single API call."""
+
+        if destination.key is None:
+            raise RuntimeError("Single-part copy requires destination key.")
 
         await self._wait_until_active(session)
         source_payload = await self._read_source_payload(
             source_client,
-            session.plan.source,
+            source,
             part_range=None,
         )
-        session.bytes_transferred = 0
+        session.bytes_transferred = session.completed_bytes
         await asyncio.to_thread(
             destination_client.put_object,
-            Bucket=session.plan.destination.bucket,
-            Key=session.plan.destination.key,
+            Bucket=destination.bucket,
+            Key=destination.key,
             Body=source_payload,
         )
-        session.bytes_transferred = len(source_payload)
+        session.bytes_transferred = session.completed_bytes + len(source_payload)
         await self._emit_progress(session.data_flow_id, self._snapshot_from_session(session))
 
     async def _copy_multipart(
@@ -395,15 +479,20 @@ class S3TransferExecutor(TransferExecutor):
         source_client: S3Client,
         destination_client: S3Client,
         session: TransferSession,
+        source: S3ObjectRef,
+        destination: S3ObjectRef,
         size: int,
     ) -> None:
         """Copy object with multipart upload and resumable part tracking."""
 
+        if destination.key is None:
+            raise RuntimeError("Multipart copy requires destination key.")
+
         if session.upload_id is None:
             response = await asyncio.to_thread(
                 destination_client.create_multipart_upload,
-                Bucket=session.plan.destination.bucket,
-                Key=session.plan.destination.key,
+                Bucket=destination.bucket,
+                Key=destination.key,
             )
             upload_id = response.get("UploadId")
             if not isinstance(upload_id, str) or not upload_id:
@@ -428,6 +517,8 @@ class S3TransferExecutor(TransferExecutor):
                         source_client=source_client,
                         destination_client=destination_client,
                         session=session,
+                        source=source,
+                        destination=destination,
                         part_number=part_number,
                         part_size=part_size,
                         object_size=size,
@@ -445,23 +536,30 @@ class S3TransferExecutor(TransferExecutor):
         await self._wait_until_active(session)
         await asyncio.to_thread(
             destination_client.complete_multipart_upload,
-            Bucket=session.plan.destination.bucket,
-            Key=session.plan.destination.key,
+            Bucket=destination.bucket,
+            Key=destination.key,
             UploadId=session.upload_id,
             MultipartUpload={"Parts": completed_parts},
         )
         session.upload_id = None
+        session.uploaded_parts.clear()
+        session.uploaded_part_sizes.clear()
 
     async def _copy_part(
         self,
         source_client: S3Client,
         destination_client: S3Client,
         session: TransferSession,
+        source: S3ObjectRef,
+        destination: S3ObjectRef,
         part_number: int,
         part_size: int,
         object_size: int,
     ) -> tuple[int, str]:
         """Copy one multipart segment and return part number + ETag."""
+
+        if destination.key is None:
+            raise RuntimeError("Multipart part copy requires destination key.")
 
         assert session.upload_id is not None
         start = (part_number - 1) * part_size
@@ -469,25 +567,182 @@ class S3TransferExecutor(TransferExecutor):
 
         payload = await self._read_source_payload(
             source_client,
-            session.plan.source,
+            source,
             part_range=(start, end),
         )
         response = await asyncio.to_thread(
             destination_client.upload_part,
-            Bucket=session.plan.destination.bucket,
-            Key=session.plan.destination.key,
+            Bucket=destination.bucket,
+            Key=destination.key,
             UploadId=session.upload_id,
             PartNumber=part_number,
             Body=payload,
         )
         session.uploaded_part_sizes[part_number] = len(payload)
-        session.bytes_transferred = sum(session.uploaded_part_sizes.values())
+        session.bytes_transferred = session.completed_bytes + sum(session.uploaded_part_sizes.values())
         await self._emit_progress(session.data_flow_id, self._snapshot_from_session(session))
         return part_number, self._extract_etag(response)
+
+    async def _build_copy_work_items(
+        self,
+        source_client: S3Client,
+        plan: S3TransferPlan,
+    ) -> list[S3CopyWorkItem]:
+        """Resolve copy plan to concrete source/destination object pairs."""
+
+        source_key = plan.source.key
+        if source_key is not None:
+            size = await self._get_source_size(source_client, self._with_key(plan.source, source_key))
+            destination_key = self._resolve_destination_key(
+                source_key=source_key,
+                destination_key=plan.destination.key,
+                source_is_bucket=False,
+            )
+            return [
+                S3CopyWorkItem(
+                    source_key=source_key,
+                    destination_key=destination_key,
+                    size_bytes=size,
+                )
+            ]
+
+        source_objects = await self._list_bucket_objects(source_client, plan.source.bucket)
+        work_items = [
+            S3CopyWorkItem(
+                source_key=source_object_key,
+                destination_key=self._resolve_destination_key(
+                    source_key=source_object_key,
+                    destination_key=plan.destination.key,
+                    source_is_bucket=True,
+                ),
+                size_bytes=size_bytes,
+            )
+            for source_object_key, size_bytes in source_objects
+        ]
+        work_items.sort(key=lambda item: item.source_key)
+        return work_items
+
+    async def _list_bucket_objects(
+        self,
+        source_client: S3Client,
+        bucket: str,
+    ) -> list[tuple[str, int]]:
+        """List source bucket objects and their sizes."""
+
+        entries: list[tuple[str, int]] = []
+        continuation_token: str | None = None
+
+        while True:
+            request_kwargs: dict[str, Any] = {"Bucket": bucket}
+            if continuation_token is not None:
+                request_kwargs["ContinuationToken"] = continuation_token
+            response = await asyncio.to_thread(
+                source_client.list_objects_v2,
+                **request_kwargs,
+            )
+            contents = response.get("Contents")
+            if isinstance(contents, list):
+                for raw_item in contents:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    key = raw_item.get("Key")
+                    size = raw_item.get("Size")
+                    if not isinstance(key, str) or not key:
+                        continue
+                    if not isinstance(size, int):
+                        size = await self._get_source_size(
+                            source_client, self._with_key(S3ObjectRef(bucket=bucket, key=None), key)
+                        )
+                    entries.append((key, size))
+
+            is_truncated = bool(response.get("IsTruncated"))
+            if not is_truncated:
+                return entries
+
+            next_token = response.get("NextContinuationToken")
+            if not isinstance(next_token, str) or not next_token:
+                raise RuntimeError("list_objects_v2 pagination missing NextContinuationToken.")
+            continuation_token = next_token
+
+    def _resolve_destination_key(
+        self,
+        source_key: str,
+        destination_key: str | None,
+        source_is_bucket: bool,
+    ) -> str:
+        """Map source key to destination key for object and bucket workflows."""
+
+        if not source_is_bucket:
+            return destination_key or source_key
+        if destination_key is None:
+            return source_key
+        normalized_prefix = destination_key.strip("/")
+        if not normalized_prefix:
+            return source_key
+        return f"{normalized_prefix}/{source_key}"
+
+    def _with_key(self, object_ref: S3ObjectRef, key: str) -> S3ObjectRef:
+        """Clone object ref while preserving bucket/client configuration."""
+
+        return S3ObjectRef(
+            bucket=object_ref.bucket,
+            key=key,
+            region=object_ref.region,
+            endpoint_url=object_ref.endpoint_url,
+            force_path_style=object_ref.force_path_style,
+            access_key_id=object_ref.access_key_id,
+            secret_access_key=object_ref.secret_access_key,
+            session_token=object_ref.session_token,
+        )
+
+    def _prepare_active_object_state(
+        self,
+        session: TransferSession,
+        source_key: str,
+        destination_key: str,
+        size: int,
+    ) -> None:
+        """Initialize per-object state, preserving multipart checkpoints for the same key."""
+
+        same_object = (
+            session.active_source_key == source_key
+            and session.active_destination_key == destination_key
+            and session.active_object_size_bytes == size
+        )
+        if same_object:
+            return
+
+        session.active_source_key = source_key
+        session.active_destination_key = destination_key
+        session.active_object_size_bytes = size
+        session.upload_id = None
+        session.uploaded_parts.clear()
+        session.uploaded_part_sizes.clear()
+        session.bytes_transferred = session.completed_bytes
+
+    def _mark_object_completed(
+        self,
+        session: TransferSession,
+        source_key: str,
+        size: int,
+    ) -> None:
+        """Finalize one object copy and reset per-object state."""
+
+        session.completed_source_keys.add(source_key)
+        session.completed_bytes += size
+        session.bytes_transferred = session.completed_bytes
+        session.active_source_key = None
+        session.active_destination_key = None
+        session.active_object_size_bytes = None
+        session.upload_id = None
+        session.uploaded_parts.clear()
+        session.uploaded_part_sizes.clear()
 
     async def _get_source_size(self, client: S3Client, source: S3ObjectRef) -> int:
         """Read source object size in bytes."""
 
+        if source.key is None:
+            raise RuntimeError("Source key is required for head_object.")
         response = await asyncio.to_thread(client.head_object, Bucket=source.bucket, Key=source.key)
         size = response.get("ContentLength")
         if not isinstance(size, int):
@@ -502,6 +757,8 @@ class S3TransferExecutor(TransferExecutor):
     ) -> bytes:
         """Read source bytes for single-part or one multipart segment."""
 
+        if source.key is None:
+            raise RuntimeError("Source key is required for get_object.")
         range_header: str | None = None
         if part_range is not None:
             start, end = part_range
@@ -546,7 +803,7 @@ class S3TransferExecutor(TransferExecutor):
     async def _abort_multipart(self, session: TransferSession) -> None:
         """Abort in-flight multipart upload on terminate."""
 
-        if session.upload_id is None:
+        if session.upload_id is None or session.active_destination_key is None:
             return
 
         client = self._s3_client_factory(
@@ -561,7 +818,7 @@ class S3TransferExecutor(TransferExecutor):
             await asyncio.to_thread(
                 client.abort_multipart_upload,
                 Bucket=session.plan.destination.bucket,
-                Key=session.plan.destination.key,
+                Key=session.active_destination_key,
                 UploadId=session.upload_id,
             )
 
@@ -639,10 +896,10 @@ class S3TransferExecutor(TransferExecutor):
         target: str,
         data_address: DataAddress | None,
     ) -> S3ObjectRef:
-        """Resolve object location from dataAddress or metadata.
+        """Resolve S3 location from dataAddress or metadata.
 
         Priority:
-        1. `dataAddress.endpoint` when present and S3-formatted.
+        1. `dataAddress.endpoint` when present and S3-formatted (`s3://bucket[/key]`).
         2. metadata keys like `<target>Bucket`/`<target>Key`.
         """
 
@@ -655,9 +912,9 @@ class S3TransferExecutor(TransferExecutor):
 
         bucket = self._pick_value(metadata, target, "Bucket")
         key = self._pick_value(metadata, target, "Key")
-        if bucket is None or key is None:
+        if bucket is None:
             raise DataFlowValidationError(
-                f"Missing {target} bucket/key metadata for S3 transfer execution."
+                f"Missing {target} bucket metadata for S3 transfer execution."
             )
 
         access_key_id = self._pick_access_key_id(metadata, target)
@@ -681,7 +938,7 @@ class S3TransferExecutor(TransferExecutor):
         )
 
     def _parse_data_address(self, data_address: DataAddress) -> S3ObjectRef:
-        """Convert `DataAddress.endpoint` to bucket/key pair."""
+        """Convert `DataAddress.endpoint` to bucket/key pair with optional key."""
 
         endpoint = data_address.endpoint
         parsed = urlparse(endpoint)
@@ -690,24 +947,29 @@ class S3TransferExecutor(TransferExecutor):
 
         if scheme == "s3":
             bucket = parsed.netloc
-            key = parsed.path.lstrip("/")
+            key = parsed.path.lstrip("/") or None
         elif scheme in {"http", "https"}:
             path_parts = parsed.path.lstrip("/").split("/", 1)
-            if len(path_parts) != 2:
+            if len(path_parts) == 1:
+                bucket = path_parts[0]
+                key = None
+            elif len(path_parts) == 2:
+                bucket, key = path_parts
+                key = key or None
+            else:
                 raise DataFlowValidationError(
-                    f"Invalid HTTP S3 endpoint '{endpoint}', expected http(s)://host/bucket/key."
+                    f"Invalid HTTP S3 endpoint '{endpoint}', expected http(s)://host/bucket[/key]."
                 )
-            bucket, key = path_parts
             endpoint_url = endpoint_url or f"{parsed.scheme}://{parsed.netloc}"
         else:
             raise DataFlowValidationError(
-                f"Unsupported dataAddress endpoint '{endpoint}', expected s3://bucket/key "
-                "or http(s)://host/bucket/key."
+                f"Unsupported dataAddress endpoint '{endpoint}', expected s3://bucket[/key] "
+                "or http(s)://host/bucket[/key]."
             )
 
-        if not bucket or not key:
+        if not bucket:
             raise DataFlowValidationError(
-                f"Invalid S3 endpoint '{endpoint}', expected s3://bucket/key."
+                f"Invalid S3 endpoint '{endpoint}', expected s3://bucket[/key]."
             )
 
         access_key_id, secret_access_key, session_token = self._credentials_from_address(
@@ -914,17 +1176,25 @@ class S3TransferExecutor(TransferExecutor):
 
         primary = f"{target}{suffix}"
         if primary in metadata:
-            return str(metadata[primary])
+            return self._optional_str(metadata[primary])
 
         if suffix == "Bucket":
             for fallback in ("bucketName", "bucket"):
                 if fallback in metadata:
-                    return str(metadata[fallback])
+                    return self._optional_str(metadata[fallback])
         if suffix == "Key":
             for fallback in ("objectKey", "key"):
                 if fallback in metadata:
-                    return str(metadata[fallback])
+                    return self._optional_str(metadata[fallback])
         return None
+
+    def _optional_str(self, raw: object) -> str | None:
+        """Normalize metadata values to optional non-empty strings."""
+
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        return text or None
 
     def _read_positive_int(self, metadata: dict[str, Any], key: str, fallback: int) -> int:
         """Parse positive integer metadata values with fallback."""

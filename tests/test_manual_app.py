@@ -178,6 +178,37 @@ def test_manual_ui_start_push_passes_credentials_via_data_address(monkeypatch: A
         assert metadata_destination_data_address["endpoint"] == "s3://bucket-b/payload-copy.bin"
 
 
+def test_manual_ui_start_push_allows_bucket_transfer_without_keys(monkeypatch: Any) -> None:
+    monkeypatch.setattr("simpl_bulk_manual_app.main.DataPlaneClient", FakeDataPlaneClient)
+    app = create_app()
+
+    with TestClient(app) as client:
+        start_response = client.post(
+            "/api/transfers/start",
+            json={
+                "dataplaneUrl": "http://localhost:8080",
+                "transferMode": "PUSH",
+                "sourceBucket": "source-bucket",
+                "sourceKey": None,
+                "destinationBucket": "destination-bucket",
+                "destinationKey": None,
+                "autoStartedNotification": True,
+            },
+        )
+        assert start_response.status_code == 200
+
+        fake_client = client.app.state.dataplane_client
+        assert len(fake_client.start_calls) == 1
+        _, payload = fake_client.start_calls[0]
+
+    metadata = payload["metadata"]
+    assert metadata["sourceBucket"] == "source-bucket"
+    assert metadata["destinationBucket"] == "destination-bucket"
+    assert "sourceKey" not in metadata
+    assert "destinationKey" not in metadata
+    assert payload["dataAddress"]["endpoint"] == "s3://destination-bucket"
+
+
 def test_manual_ui_start_rejects_partial_credential_pairs(monkeypatch: Any) -> None:
     monkeypatch.setattr("simpl_bulk_manual_app.main.DataPlaneClient", FakeDataPlaneClient)
     app = create_app()
