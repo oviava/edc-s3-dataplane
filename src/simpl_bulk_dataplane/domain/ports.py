@@ -1,0 +1,76 @@
+"""Ports for repository, transfer execution, and callbacks."""
+
+from __future__ import annotations
+
+from typing import Protocol
+
+from simpl_bulk_dataplane.domain.entities import DataFlow
+from simpl_bulk_dataplane.domain.signaling_models import (
+    DataAddress,
+    DataFlowPrepareMessage,
+    DataFlowResponseMessage,
+    DataFlowStartedNotificationMessage,
+    DataFlowStartMessage,
+)
+
+
+class DataFlowRepository(Protocol):
+    """Persistence port for data flows."""
+
+    async def get_by_data_flow_id(self, data_flow_id: str) -> DataFlow | None:
+        """Return a data flow by its generated dataFlowId."""
+
+    async def get_by_process_id(self, process_id: str) -> DataFlow | None:
+        """Return a data flow by transfer process id."""
+
+    async def upsert(self, data_flow: DataFlow) -> None:
+        """Create or update a data flow."""
+
+
+class TransferExecutor(Protocol):
+    """Wire protocol execution port."""
+
+    async def prepare(
+        self, data_flow: DataFlow, message: DataFlowPrepareMessage
+    ) -> DataAddress | None:
+        """Prepare resources before transfer start."""
+
+    async def start(self, data_flow: DataFlow, message: DataFlowStartMessage) -> DataAddress | None:
+        """Start transfer execution."""
+
+    async def notify_started(
+        self,
+        data_flow: DataFlow,
+        message: DataFlowStartedNotificationMessage | None,
+    ) -> None:
+        """Handle consumer-side started signal."""
+
+    async def suspend(self, data_flow: DataFlow, reason: str | None) -> None:
+        """Suspend ongoing transfer activity."""
+
+    async def terminate(self, data_flow: DataFlow, reason: str | None) -> None:
+        """Terminate transfer activity."""
+
+    async def complete(self, data_flow: DataFlow) -> None:
+        """Finalize transfer activity."""
+
+
+class ControlPlaneNotifier(Protocol):
+    """Outbound callback port to control plane endpoints."""
+
+    async def notify_prepared(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
+        """Signal PREPARED state to control plane."""
+
+    async def notify_started(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
+        """Signal STARTED state to control plane."""
+
+    async def notify_completed(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
+        """Signal COMPLETED state to control plane."""
+
+    async def notify_terminated(
+        self, data_flow: DataFlow, message: DataFlowResponseMessage
+    ) -> None:
+        """Signal TERMINATED state to control plane."""
+
+
+__all__ = ["ControlPlaneNotifier", "DataFlowRepository", "TransferExecutor"]
