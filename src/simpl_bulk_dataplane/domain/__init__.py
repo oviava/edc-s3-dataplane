@@ -8,6 +8,12 @@ from simpl_bulk_dataplane.domain.errors import (
     DataFlowValidationError,
     UnsupportedTransferTypeError,
 )
+from simpl_bulk_dataplane.domain.monitoring_models import (
+    DataFlowInfoResponse,
+    DataFlowListResponse,
+    DataFlowProgressResponse,
+    TransferProgressSnapshot,
+)
 from simpl_bulk_dataplane.domain.ports import (
     ControlPlaneNotifier,
     DataFlowRepository,
@@ -32,6 +38,9 @@ __all__ = [
     "DataFlow",
     "DataFlowConflictError",
     "DataFlowError",
+    "DataFlowInfoResponse",
+    "DataFlowListResponse",
+    "DataFlowProgressResponse",
     "DataFlowNotFoundError",
     "DataFlowPrepareMessage",
     "DataFlowRepository",
@@ -45,6 +54,7 @@ __all__ = [
     "DataFlowValidationError",
     "EndpointProperty",
     "TransferExecutor",
+    "TransferProgressSnapshot",
     "TransferMode",
     "UnsupportedTransferTypeError",
 ]

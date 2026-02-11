@@ -6,6 +6,7 @@ import pytest
 
 from simpl_bulk_dataplane.application.services import DataFlowService
 from simpl_bulk_dataplane.domain.errors import DataFlowValidationError
+from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
 from simpl_bulk_dataplane.domain.ports import TransferExecutor
 from simpl_bulk_dataplane.domain.signaling_models import (
     DataAddress,
@@ -120,6 +121,9 @@ class RecordingTransferExecutor(TransferExecutor):
         return None
 
     async def complete(self, *_: object, **__: object) -> None:
+        return None
+
+    async def get_progress(self, *_: object, **__: object) -> TransferProgressSnapshot | None:
         return None
 
 

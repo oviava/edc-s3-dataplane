@@ -28,12 +28,16 @@ dev = [
 
 [project.scripts]
 simpl-bulk-dataplane = "simpl_bulk_dataplane.main:run"
+simpl-bulk-manual-ui = "simpl_bulk_manual_app.main:run"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+simpl_bulk_manual_app = ["static/*.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

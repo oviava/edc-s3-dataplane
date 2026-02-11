@@ -29,6 +29,12 @@ class InMemoryDataFlowRepository(DataFlowRepository):
             return None
         return self._by_data_flow_id.get(data_flow_id)
 
+    async def list_data_flows(self) -> list[DataFlow]:
+        """Return all flows in insertion order."""
+
+        async with self._lock:
+            return list(self._by_data_flow_id.values())
+
     async def upsert(self, data_flow: DataFlow) -> None:
         """Persist entity state."""
 

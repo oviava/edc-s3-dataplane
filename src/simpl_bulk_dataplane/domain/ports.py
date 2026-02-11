@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from simpl_bulk_dataplane.domain.entities import DataFlow
+from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
 from simpl_bulk_dataplane.domain.signaling_models import (
     DataAddress,
     DataFlowPrepareMessage,
@@ -22,6 +23,9 @@ class DataFlowRepository(Protocol):
 
     async def get_by_process_id(self, process_id: str) -> DataFlow | None:
         """Return a data flow by transfer process id."""
+
+    async def list_data_flows(self) -> list[DataFlow]:
+        """Return all known data flows."""
 
     async def upsert(self, data_flow: DataFlow) -> None:
         """Create or update a data flow."""
@@ -53,6 +57,9 @@ class TransferExecutor(Protocol):
 
     async def complete(self, data_flow: DataFlow) -> None:
         """Finalize transfer activity."""
+
+    async def get_progress(self, data_flow_id: str) -> TransferProgressSnapshot | None:
+        """Return runtime transfer progress when available."""
 
 
 class ControlPlaneNotifier(Protocol):

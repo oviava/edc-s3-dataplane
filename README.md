@@ -11,6 +11,10 @@ src/simpl_bulk_dataplane/
   domain/            # State, entities, contracts, and signaling models
   infrastructure/    # In-memory repository and S3 transfer adapters
   main.py            # FastAPI app factory and local runner
+src/simpl_bulk_manual_app/
+  main.py            # Separate manual E2E UI app
+  client.py          # Dataplane API client for the manual UI
+  static/index.html  # Browser UI
 tests/               # Service and API smoke tests
 ```
 
@@ -21,6 +25,19 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
 uvicorn simpl_bulk_dataplane.main:app --reload --port 8080
+```
+
+Run the separate manual E2E UI app:
+
+```bash
+uvicorn simpl_bulk_manual_app.main:app --reload --port 8090
+```
+
+Or via console scripts:
+
+```bash
+simpl-bulk-dataplane
+simpl-bulk-manual-ui
 ```
 
 ## Run tests
@@ -48,6 +65,20 @@ SIMPL_DP_REPOSITORY_BACKEND=postgres \
 SIMPL_DP_POSTGRES_DSN=postgresql://simpl:simpl@localhost:5432/simpl_dataplane \
 uvicorn simpl_bulk_dataplane.main:app --reload --port 8080
 ```
+
+## Management endpoints (separate route)
+
+- `GET /management/dataflows`
+  - Optional query: `mode=PUSH|PULL`
+  - Returns all flows with state + progress (`bytesTotal`, `bytesTransferred`, `percentComplete`, `running`, `paused`, `finished`, `lastError`)
+- `GET /management/dataflows/{id}`
+  - Returns one flow with the same progress payload
+
+Pause/resume behavior remains on signaling endpoints:
+- Pause: `POST /dataflows/{id}/suspend`
+- Resume:
+  - Push flows: call `POST /dataflows/start` again
+  - Pull flows: call `POST /dataflows/{id}/started` (or replay `start` + `started`)
 
 ## Notes
 

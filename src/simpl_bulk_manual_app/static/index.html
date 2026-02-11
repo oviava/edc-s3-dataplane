@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Simpl Bulk Manual E2E UI</title>
+    <style>
+      :root {
+        --bg: #f3f7fb;
+        --card: #ffffff;
+        --line: #d7e1ea;
+        --text: #112133;
+        --muted: #5b7186;
+        --brand: #0969da;
+        --brand-strong: #0552a5;
+        --warn: #b54708;
+        --danger: #c2333a;
+        --ok: #167f54;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        color: var(--text);
+        background: radial-gradient(circle at 15% 15%, #d8ebff 0%, transparent 45%),
+          radial-gradient(circle at 85% 8%, #d7ffe8 0%, transparent 38%), var(--bg);
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+      }
+      .layout {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 16px;
+      }
+      .title {
+        margin: 8px 0 18px;
+        font-size: 1.6rem;
+        letter-spacing: 0.02em;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        box-shadow: 0 8px 18px rgba(17, 33, 51, 0.06);
+        padding: 14px;
+      }
+      .card h2 {
+        margin: 0 0 12px;
+        font-size: 1.02rem;
+      }
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .form-grid .full {
+        grid-column: 1 / -1;
+      }
+      label {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 0.84rem;
+        color: var(--muted);
+      }
+      input,
+      select {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        color: var(--text);
+      }
+      .button-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      button {
+        border: 1px solid var(--brand);
+        background: var(--brand);
+        color: #fff;
+        padding: 8px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button:hover {
+        background: var(--brand-strong);
+        border-color: var(--brand-strong);
+      }
+      button.secondary {
+        background: #fff;
+        color: var(--brand);
+      }
+      button.warn {
+        border-color: var(--warn);
+        background: var(--warn);
+      }
+      button.resume {
+        border-color: var(--ok);
+        background: var(--ok);
+      }
+      .status {
+        min-height: 22px;
+        font-size: 0.88rem;
+        color: var(--muted);
+      }
+      .status.error {
+        color: var(--danger);
+      }
+      .status.ok {
+        color: var(--ok);
+      }
+      .flows-table-wrap {
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 980px;
+      }
+      th,
+      td {
+        padding: 8px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        font-size: 0.84rem;
+        vertical-align: top;
+      }
+      th {
+        background: #eef4fb;
+        color: #1e344d;
+      }
+      .mono {
+        font-family: Menlo, Consolas, monospace;
+      }
+      .badge {
+        border: 1px solid #a3b9d0;
+        color: #21476e;
+        background: #e9f2fb;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 0.74rem;
+        font-weight: 700;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .inline-checkbox {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 0.84rem;
+      }
+      @media (max-width: 760px) {
+        .form-grid {
+          grid-template-columns: 1fr;
+        }
+        table {
+          min-width: 840px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <h1 class="title">Simpl Bulk Manual E2E UI</h1>
+
+      <div class="grid">
+        <section class="card">
+          <h2>Start Transfer</h2>
+          <form id="start-form" class="form-grid">
+            <label>
+              Dataplane URL
+              <input id="start-dataplane-url" type="text" required />
+            </label>
+            <label>
+              Transfer mode
+              <select id="transfer-mode">
+                <option value="PUSH">PUSH</option>
+                <option value="PULL">PULL</option>
+              </select>
+            </label>
+            <label>
+              Source bucket
+              <input id="source-bucket" type="text" required />
+            </label>
+            <label>
+              Source key (file)
+              <input id="source-key" type="text" required />
+            </label>
+            <label>
+              Destination bucket
+              <input id="destination-bucket" type="text" required />
+            </label>
+            <label>
+              Destination key (file)
+              <input id="destination-key" type="text" required />
+            </label>
+            <label>
+              Source endpoint URL (optional)
+              <input id="source-endpoint-url" type="text" />
+            </label>
+            <label>
+              Destination endpoint URL (optional)
+              <input id="destination-endpoint-url" type="text" />
+            </label>
+            <label class="full">
+              Process ID (optional)
+              <input id="process-id" type="text" />
+            </label>
+            <div class="full inline-checkbox">
+              <input id="auto-started" type="checkbox" checked />
+              <label for="auto-started">Auto-send /started for PULL start</label>
+            </div>
+            <div class="full button-row">
+              <button type="submit">Start Transfer</button>
+            </div>
+          </form>
+          <p id="start-status" class="status"></p>
+        </section>
+
+        <section class="card">
+          <h2>Monitor Dataflows</h2>
+          <div class="form-grid">
+            <label class="full">
+              Dataplane URLs (comma separated)
+              <input id="poll-dataplane-urls" type="text" />
+            </label>
+            <div class="full button-row">
+              <button id="refresh-flows" class="secondary">Refresh Now</button>
+              <label class="inline-checkbox">
+                <input id="auto-refresh" type="checkbox" checked />
+                Auto refresh (every 3s)
+              </label>
+            </div>
+          </div>
+          <p id="poll-status" class="status"></p>
+
+          <div class="flows-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Dataplane</th>
+                  <th>Flow</th>
+                  <th>Process</th>
+                  <th>Mode</th>
+                  <th>State</th>
+                  <th>Source</th>
+                  <th>Destination</th>
+                  <th>Progress</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="flows-table-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      const startStatus = document.getElementById("start-status");
+      const pollStatus = document.getElementById("poll-status");
+      const flowsTableBody = document.getElementById("flows-table-body");
+      const autoRefresh = document.getElementById("auto-refresh");
+
+      function setStatus(element, message, kind = "neutral") {
+        element.className = "status";
+        if (kind === "error") element.classList.add("error");
+        if (kind === "ok") element.classList.add("ok");
+        element.textContent = message;
+      }
+
+      function parseDataplaneUrls() {
+        const raw = document.getElementById("poll-dataplane-urls").value || "";
+        return raw
+          .split(",")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0);
+      }
+
+      async function callJson(url, options = {}) {
+        const response = await fetch(url, {
+          headers: { "Content-Type": "application/json" },
+          ...options,
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const detail = payload?.detail || JSON.stringify(payload);
+          throw new Error(detail || `${response.status} ${response.statusText}`);
+        }
+        return payload;
+      }
+
+      function progressText(flow) {
+        const progress = flow.progress || {};
+        const percent = progress.percentComplete;
+        const transferred = progress.bytesTransferred ?? 0;
+        const total = progress.bytesTotal;
+        const state = [];
+        if (progress.paused) state.push("paused");
+        if (progress.running) state.push("running");
+        if (progress.finished) state.push("finished");
+        const ratio = total ? `${transferred}/${total} bytes` : `${transferred} bytes`;
+        const percentText = percent == null ? "n/a" : `${percent.toFixed(2)}%`;
+        return `${percentText} (${ratio})${state.length ? ` [${state.join(", ")}]` : ""}`;
+      }
+
+      function renderFlows(results) {
+        const rows = [];
+        for (const result of results) {
+          if (result.error) {
+            rows.push(`
+              <tr>
+                <td class="mono">${result.dataplaneUrl}</td>
+                <td colspan="8" class="muted">Error: ${result.error}</td>
+              </tr>
+            `);
+            continue;
+          }
+
+          const flows = result.dataFlows || [];
+          if (!flows.length) {
+            rows.push(`
+              <tr>
+                <td class="mono">${result.dataplaneUrl}</td>
+                <td colspan="8" class="muted">No dataflows</td>
+              </tr>
+            `);
+            continue;
+          }
+
+          for (const flow of flows) {
+            const source = `${flow.sourceBucket || "-"} / ${flow.sourceKey || "-"}`;
+            const destination = `${flow.destinationBucket || "-"} / ${flow.destinationKey || "-"}`;
+            rows.push(`
+              <tr>
+                <td class="mono">${result.dataplaneUrl}</td>
+                <td class="mono">${flow.dataFlowId}</td>
+                <td class="mono">${flow.processId}</td>
+                <td><span class="badge">${flow.transferMode}</span></td>
+                <td>${flow.state}</td>
+                <td class="mono">${source}</td>
+                <td class="mono">${destination}</td>
+                <td>${progressText(flow)}</td>
+                <td class="button-row">
+                  <button class="warn" data-action="pause" data-url="${result.dataplaneUrl}" data-flow-id="${flow.dataFlowId}">Pause</button>
+                  <button class="resume" data-action="start" data-url="${result.dataplaneUrl}" data-flow-id="${flow.dataFlowId}">Start</button>
+                </td>
+              </tr>
+            `);
+          }
+        }
+        flowsTableBody.innerHTML = rows.join("");
+      }
+
+      async function refreshFlows() {
+        const dataplaneUrls = parseDataplaneUrls();
+        if (!dataplaneUrls.length) {
+          setStatus(pollStatus, "Enter at least one dataplane URL.", "error");
+          return;
+        }
+
+        try {
+          const payload = await callJson("/api/dataflows/query", {
+            method: "POST",
+            body: JSON.stringify({ dataplaneUrls }),
+          });
+          renderFlows(payload.results || []);
+          setStatus(pollStatus, `Loaded ${dataplaneUrls.length} dataplane(s).`, "ok");
+        } catch (error) {
+          setStatus(pollStatus, String(error), "error");
+        }
+      }
+
+      async function startTransfer(event) {
+        event.preventDefault();
+        const payload = {
+          dataplaneUrl: document.getElementById("start-dataplane-url").value.trim(),
+          transferMode: document.getElementById("transfer-mode").value,
+          sourceBucket: document.getElementById("source-bucket").value.trim(),
+          sourceKey: document.getElementById("source-key").value.trim(),
+          destinationBucket: document.getElementById("destination-bucket").value.trim(),
+          destinationKey: document.getElementById("destination-key").value.trim(),
+          sourceEndpointUrl: document.getElementById("source-endpoint-url").value.trim() || null,
+          destinationEndpointUrl:
+            document.getElementById("destination-endpoint-url").value.trim() || null,
+          processId: document.getElementById("process-id").value.trim() || null,
+          autoStartedNotification: document.getElementById("auto-started").checked,
+        };
+
+        try {
+          const response = await callJson("/api/transfers/start", {
+            method: "POST",
+            body: JSON.stringify(payload),
+          });
+          setStatus(
+            startStatus,
+            `Started flow ${response.dataFlowId} on ${response.dataplaneUrl} (${response.state}).`,
+            "ok"
+          );
+          await refreshFlows();
+        } catch (error) {
+          setStatus(startStatus, String(error), "error");
+        }
+      }
+
+      async function handleActionClick(event) {
+        const target = event.target;
+        if (!(target instanceof HTMLButtonElement)) return;
+        const action = target.dataset.action;
+        const dataplaneUrl = target.dataset.url;
+        const dataFlowId = target.dataset.flowId;
+        if (!action || !dataplaneUrl || !dataFlowId) return;
+
+        try {
+          if (action === "pause") {
+            await callJson(`/api/transfers/${dataFlowId}/pause`, {
+              method: "POST",
+              body: JSON.stringify({ dataplaneUrl }),
+            });
+            setStatus(pollStatus, `Paused ${dataFlowId}.`, "ok");
+          } else if (action === "start") {
+            await callJson(`/api/transfers/${dataFlowId}/start`, {
+              method: "POST",
+              body: JSON.stringify({ dataplaneUrl }),
+            });
+            setStatus(pollStatus, `Start sent for ${dataFlowId}.`, "ok");
+          }
+          await refreshFlows();
+        } catch (error) {
+          setStatus(pollStatus, String(error), "error");
+        }
+      }
+
+      async function init() {
+        try {
+          const config = await callJson("/api/config");
+          const urls = config.defaultDataplaneUrls || ["http://localhost:8080"];
+          document.getElementById("poll-dataplane-urls").value = urls.join(", ");
+          document.getElementById("start-dataplane-url").value = urls[0];
+          document.getElementById("source-bucket").value = "source-bucket";
+          document.getElementById("source-key").value = "payload.bin";
+          document.getElementById("destination-bucket").value = "destination-bucket";
+          document.getElementById("destination-key").value = "payload-copy.bin";
+          await refreshFlows();
+        } catch (error) {
+          setStatus(pollStatus, String(error), "error");
+        }
+      }
+
+      document.getElementById("start-form").addEventListener("submit", startTransfer);
+      document.getElementById("refresh-flows").addEventListener("click", refreshFlows);
+      flowsTableBody.addEventListener("click", handleActionClick);
+      setInterval(() => {
+        if (autoRefresh.checked) {
+          refreshFlows();
+        }
+      }, 3000);
+      init();
+    </script>
+  </body>
+</html>

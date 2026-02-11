@@ -70,6 +70,15 @@ class PostgresDataFlowRepository(DataFlowRepository):
             return None
         return self._to_entity(row)
 
+    async def list_data_flows(self) -> list[DataFlow]:
+        """Return all flows."""
+
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            f"SELECT {_SELECT_COLUMNS} FROM dataflows ORDER BY process_id ASC",
+        )
+        return [self._to_entity(row) for row in rows]
+
     async def upsert(self, data_flow: DataFlow) -> None:
         """Persist entity state."""
 

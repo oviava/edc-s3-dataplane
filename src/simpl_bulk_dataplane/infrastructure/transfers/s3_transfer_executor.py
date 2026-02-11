@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from simpl_bulk_dataplane.domain.entities import DataFlow
 from simpl_bulk_dataplane.domain.errors import DataFlowValidationError
+from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
 from simpl_bulk_dataplane.domain.ports import TransferExecutor
 from simpl_bulk_dataplane.domain.signaling_models import (
     DataAddress,
@@ -114,6 +115,9 @@ class TransferSession:
     task: asyncio.Task[None] | None = None
     upload_id: str | None = None
     uploaded_parts: dict[int, str] = field(default_factory=dict)
+    uploaded_part_sizes: dict[int, int] = field(default_factory=dict)
+    object_size_bytes: int | None = None
+    bytes_transferred: int = 0
     finished: bool = False
     last_error: str | None = None
 
@@ -149,6 +153,7 @@ class S3TransferExecutor(TransferExecutor):
         self._multipart_part_size_bytes = part_size_mb * 1024 * 1024
         self._multipart_concurrency = max(1, multipart_concurrency)
         self._sessions: dict[str, TransferSession] = {}
+        self._history: dict[str, TransferProgressSnapshot] = {}
         self._sessions_lock = asyncio.Lock()
         self._s3_client_factory = s3_client_factory or self._build_default_s3_client
 
@@ -245,6 +250,10 @@ class S3TransferExecutor(TransferExecutor):
         if session.upload_id is not None and not session.finished:
             await self._abort_multipart(session)
 
+        if session.last_error is None:
+            session.last_error = "Transfer terminated by request."
+        self._remember_snapshot(data_flow.data_flow_id, self._snapshot_from_session(session))
+
     async def complete(self, data_flow: DataFlow) -> None:
         """Wait for active task completion when applicable."""
 
@@ -256,7 +265,17 @@ class S3TransferExecutor(TransferExecutor):
             await session.task
 
         if session.finished:
+            snapshot = self._snapshot_from_session(session)
+            self._remember_snapshot(data_flow.data_flow_id, snapshot)
             await self._pop_session(data_flow.data_flow_id)
+
+    async def get_progress(self, data_flow_id: str) -> TransferProgressSnapshot | None:
+        """Return runtime snapshot for active or recently finished flows."""
+
+        session = self._sessions.get(data_flow_id)
+        if session is not None:
+            return self._snapshot_from_session(session)
+        return self._history.get(data_flow_id)
 
     async def _start_or_resume(self, data_flow_id: str, plan: S3TransferPlan) -> None:
         """Start background task or resume a paused one."""
@@ -288,6 +307,8 @@ class S3TransferExecutor(TransferExecutor):
             try:
                 await self._execute_plan(session)
                 session.finished = True
+                if session.object_size_bytes is not None:
+                    session.bytes_transferred = session.object_size_bytes
                 session.last_error = None
             except asyncio.CancelledError:
                 session.last_error = "Transfer task cancelled"
@@ -316,6 +337,7 @@ class S3TransferExecutor(TransferExecutor):
         )
 
         size = await self._get_source_size(source_client, session.plan.source)
+        session.object_size_bytes = size
         use_multipart = (
             session.plan.force_multipart
             or size >= session.plan.multipart_threshold_bytes
@@ -342,12 +364,14 @@ class S3TransferExecutor(TransferExecutor):
             session.plan.source,
             part_range=None,
         )
+        session.bytes_transferred = 0
         await asyncio.to_thread(
             destination_client.put_object,
             Bucket=session.plan.destination.bucket,
             Key=session.plan.destination.key,
             Body=source_payload,
         )
+        session.bytes_transferred = len(source_payload)
 
     async def _copy_multipart(
         self,
@@ -439,6 +463,8 @@ class S3TransferExecutor(TransferExecutor):
             PartNumber=part_number,
             Body=payload,
         )
+        session.uploaded_part_sizes[part_number] = len(payload)
+        session.bytes_transferred = sum(session.uploaded_part_sizes.values())
         return part_number, self._extract_etag(response)
 
     async def _get_source_size(self, client: S3Client, source: S3ObjectRef) -> int:
@@ -526,6 +552,24 @@ class S3TransferExecutor(TransferExecutor):
 
         async with self._sessions_lock:
             return self._sessions.pop(data_flow_id, None)
+
+    def _snapshot_from_session(self, session: TransferSession) -> TransferProgressSnapshot:
+        """Build a read-safe progress payload from runtime state."""
+
+        task_running = session.task is not None and not session.task.done() and not session.finished
+        return TransferProgressSnapshot(
+            bytes_total=session.object_size_bytes,
+            bytes_transferred=session.bytes_transferred,
+            running=task_running,
+            paused=(task_running and not session.pause_event.is_set()),
+            finished=session.finished,
+            last_error=session.last_error,
+        )
+
+    def _remember_snapshot(self, data_flow_id: str, snapshot: TransferProgressSnapshot) -> None:
+        """Store latest snapshot for completed/terminated flows."""
+
+        self._history[data_flow_id] = snapshot
 
     def _build_plan(
         self,
