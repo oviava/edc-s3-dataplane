@@ -15,9 +15,14 @@ from simpl_bulk_dataplane.domain.callbacks import (
     PendingControlPlaneCallbackEvent,
 )
 from simpl_bulk_dataplane.domain.entities import DataFlow
-from simpl_bulk_dataplane.domain.ports import CallbackOutboxRepository, DataFlowRepository
+from simpl_bulk_dataplane.domain.ports import (
+    CallbackOutboxRepository,
+    DataFlowRepository,
+    TransferJobRepository,
+)
 from simpl_bulk_dataplane.domain.signaling_models import DataAddress, DataFlowResponseMessage
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState, TransferMode
+from simpl_bulk_dataplane.domain.transfer_jobs import ClaimedTransferJob, TransferJobStatus
 
 _SELECT_COLUMNS = """
     data_flow_id,
@@ -37,7 +42,11 @@ _SELECT_COLUMNS = """
 """
 
 
-class PostgresDataFlowRepository(DataFlowRepository, CallbackOutboxRepository):
+class PostgresDataFlowRepository(
+    DataFlowRepository,
+    CallbackOutboxRepository,
+    TransferJobRepository,
+):
     """Data flow repository backed by PostgreSQL."""
 
     def __init__(
@@ -190,6 +199,151 @@ class PostgresDataFlowRepository(DataFlowRepository, CallbackOutboxRepository):
             error,
         )
 
+    async def upsert_transfer_job(
+        self,
+        *,
+        data_flow_id: str,
+        status: TransferJobStatus,
+        lease_owner: str | None = None,
+        lease_seconds: float | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Create or update transfer job state."""
+
+        pool = await self._get_pool()
+        checkpoint_json = json.dumps(checkpoint or {})
+        lease_window_seconds = None if lease_seconds is None else max(lease_seconds, 0.0)
+        await pool.execute(
+            """
+            INSERT INTO transfer_jobs (
+                data_flow_id,
+                status,
+                lease_owner,
+                lease_until,
+                checkpoint_json,
+                last_error,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            ) VALUES (
+                $1,
+                $2,
+                $3,
+                CASE
+                    WHEN $3::text IS NOT NULL AND $4::double precision IS NOT NULL
+                    THEN NOW() + ($4::double precision * INTERVAL '1 second')
+                    ELSE NULL
+                END,
+                $5::jsonb,
+                $6,
+                CASE WHEN $2 = 'RUNNING' THEN NOW() ELSE NULL END,
+                CASE
+                    WHEN $2 IN ('COMPLETED', 'FAILED', 'TERMINATED') THEN NOW()
+                    ELSE NULL
+                END,
+                NOW(),
+                NOW()
+            )
+            ON CONFLICT (data_flow_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                lease_owner = EXCLUDED.lease_owner,
+                lease_until = EXCLUDED.lease_until,
+                checkpoint_json = EXCLUDED.checkpoint_json,
+                last_error = EXCLUDED.last_error,
+                started_at = CASE
+                    WHEN EXCLUDED.status = 'RUNNING'
+                    THEN COALESCE(transfer_jobs.started_at, NOW())
+                    ELSE transfer_jobs.started_at
+                END,
+                completed_at = CASE
+                    WHEN EXCLUDED.status IN ('COMPLETED', 'FAILED', 'TERMINATED') THEN NOW()
+                    ELSE NULL
+                END,
+                updated_at = NOW()
+            """,
+            data_flow_id,
+            status.value,
+            lease_owner,
+            lease_window_seconds,
+            checkpoint_json,
+            last_error,
+        )
+
+    async def claim_due_transfer_jobs(
+        self,
+        *,
+        lease_owner: str,
+        limit: int,
+        lease_seconds: float,
+    ) -> list[ClaimedTransferJob]:
+        """Claim queued/running jobs whose lease is absent/expired."""
+
+        if limit <= 0:
+            return []
+
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            """
+            WITH due AS (
+                SELECT data_flow_id
+                FROM transfer_jobs
+                WHERE status IN ('QUEUED', 'RUNNING')
+                  AND (lease_until IS NULL OR lease_until <= NOW())
+                ORDER BY updated_at ASC, data_flow_id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE transfer_jobs AS jobs
+            SET
+                status = 'RUNNING',
+                lease_owner = $2,
+                lease_until = NOW() + ($3::double precision * INTERVAL '1 second'),
+                attempt = jobs.attempt + 1,
+                started_at = COALESCE(jobs.started_at, NOW()),
+                updated_at = NOW()
+            FROM due
+            WHERE jobs.data_flow_id = due.data_flow_id
+            RETURNING
+                jobs.data_flow_id,
+                jobs.status,
+                jobs.lease_owner,
+                jobs.attempt,
+                jobs.checkpoint_json
+            """,
+            limit,
+            lease_owner,
+            max(lease_seconds, 0.0),
+        )
+        return [self._to_claimed_transfer_job(row) for row in rows]
+
+    async def renew_transfer_job_lease(
+        self,
+        *,
+        data_flow_id: str,
+        lease_owner: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend one running job lease if ownership still matches."""
+
+        pool = await self._get_pool()
+        result = await pool.execute(
+            """
+            UPDATE transfer_jobs
+            SET
+                lease_until = NOW() + ($3::double precision * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE data_flow_id = $1
+              AND status = 'RUNNING'
+              AND lease_owner = $2
+            """,
+            data_flow_id,
+            lease_owner,
+            max(lease_seconds, 0.0),
+        )
+        return result.endswith("1")
+
     async def close(self) -> None:
         """Close the pool if it was initialized."""
 
@@ -254,6 +408,26 @@ class PostgresDataFlowRepository(DataFlowRepository, CallbackOutboxRepository):
             CREATE INDEX IF NOT EXISTS idx_control_plane_outbox_pending
                 ON control_plane_outbox (next_attempt_at, id)
                 WHERE sent_at IS NULL;
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transfer_jobs (
+                data_flow_id TEXT PRIMARY KEY REFERENCES dataflows(data_flow_id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_until TIMESTAMPTZ,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                checkpoint_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_transfer_jobs_recovery
+                ON transfer_jobs (status, lease_until, updated_at, data_flow_id)
+                WHERE status IN ('QUEUED', 'RUNNING');
             """
         )
 
@@ -387,6 +561,17 @@ class PostgresDataFlowRepository(DataFlowRepository, CallbackOutboxRepository):
             callback_address=self._as_optional_str(row["callback_address"]),
             payload=payload,
             attempts=int(row["attempts"]),
+        )
+
+    def _to_claimed_transfer_job(self, row: asyncpg.Record) -> ClaimedTransferJob:
+        checkpoint_raw = self._decode_json_field(row["checkpoint_json"])
+        checkpoint = checkpoint_raw if isinstance(checkpoint_raw, dict) else {}
+        return ClaimedTransferJob(
+            data_flow_id=str(row["data_flow_id"]),
+            status=TransferJobStatus(str(row["status"])),
+            lease_owner=str(row["lease_owner"]),
+            attempt=int(row["attempt"]),
+            checkpoint=checkpoint,
         )
 
     def _decode_json_field(self, value: object) -> Any:

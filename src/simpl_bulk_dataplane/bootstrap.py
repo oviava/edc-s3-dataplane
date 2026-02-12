@@ -11,6 +11,7 @@ from simpl_bulk_dataplane.domain.ports import (
     ControlPlaneNotifier,
     DataFlowEventPublisher,
     DataFlowRepository,
+    TransferJobRepository,
 )
 from simpl_bulk_dataplane.domain.signaling_models import DataPlaneRegistrationMessage
 from simpl_bulk_dataplane.infrastructure.callbacks import (
@@ -200,6 +201,13 @@ def build_dataflow_service(settings: Settings) -> DataFlowService:
         control_plane_notifier=control_plane_wiring.notifier,
         dataflow_event_publisher=event_publisher,
         callback_outbox_dispatcher=callback_outbox_dispatcher,
+        transfer_job_repository=(
+            repository if isinstance(repository, TransferJobRepository) else None
+        ),
+        transfer_job_recovery_poll_seconds=settings.transfer_job_recovery_poll_seconds,
+        transfer_job_recovery_batch_size=settings.transfer_job_recovery_batch_size,
+        transfer_job_lease_seconds=settings.transfer_job_lease_seconds,
+        transfer_job_heartbeat_seconds=settings.transfer_job_heartbeat_seconds,
     )
 
 

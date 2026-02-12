@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -30,6 +32,7 @@ from simpl_bulk_dataplane.domain.ports import (
     ControlPlaneNotifier,
     DataFlowEventPublisher,
     DataFlowRepository,
+    TransferJobRepository,
     TransferExecutor,
 )
 from simpl_bulk_dataplane.domain.signaling_models import (
@@ -50,11 +53,18 @@ from simpl_bulk_dataplane.domain.transfer_types import (
     ensure_s3_transfer_type,
     parse_transfer_mode,
 )
+from simpl_bulk_dataplane.domain.transfer_jobs import TransferJobStatus
 
 _FLOW_ORIGIN_METADATA_KEY = "_dpsFlowOrigin"
 _FLOW_ORIGIN_PREPARE = "prepare"
 _FLOW_ORIGIN_START = "start"
 _STARTED_NOTIFICATION_SEEN_METADATA_KEY = "_dpsStartedNotificationSeen"
+_DEFAULT_TRANSFER_JOB_RECOVERY_POLL_SECONDS = 1.0
+_DEFAULT_TRANSFER_JOB_RECOVERY_BATCH_SIZE = 20
+_DEFAULT_TRANSFER_JOB_LEASE_SECONDS = 30.0
+_DEFAULT_TRANSFER_JOB_HEARTBEAT_SECONDS = 10.0
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -102,6 +112,11 @@ class DataFlowService:
         control_plane_notifier: ControlPlaneNotifier,
         dataflow_event_publisher: DataFlowEventPublisher,
         callback_outbox_dispatcher: _CallbackOutboxDispatcher | None = None,
+        transfer_job_repository: TransferJobRepository | None = None,
+        transfer_job_recovery_poll_seconds: float = _DEFAULT_TRANSFER_JOB_RECOVERY_POLL_SECONDS,
+        transfer_job_recovery_batch_size: int = _DEFAULT_TRANSFER_JOB_RECOVERY_BATCH_SIZE,
+        transfer_job_lease_seconds: float = _DEFAULT_TRANSFER_JOB_LEASE_SECONDS,
+        transfer_job_heartbeat_seconds: float = _DEFAULT_TRANSFER_JOB_HEARTBEAT_SECONDS,
     ) -> None:
         self._dataplane_id = dataplane_id
         self._repository = repository
@@ -109,24 +124,57 @@ class DataFlowService:
         self._control_plane_notifier = control_plane_notifier
         self._dataflow_event_publisher = dataflow_event_publisher
         self._callback_outbox_dispatcher = callback_outbox_dispatcher
+        if transfer_job_repository is not None:
+            self._transfer_job_repository = transfer_job_repository
+        elif isinstance(repository, TransferJobRepository):
+            self._transfer_job_repository = repository
+        else:
+            self._transfer_job_repository = None
+        self._transfer_job_recovery_poll_seconds = max(transfer_job_recovery_poll_seconds, 0.05)
+        self._transfer_job_recovery_batch_size = max(transfer_job_recovery_batch_size, 1)
+        self._transfer_job_lease_seconds = max(transfer_job_lease_seconds, 1.0)
+        self._transfer_job_heartbeat_seconds = max(
+            min(transfer_job_heartbeat_seconds, self._transfer_job_lease_seconds),
+            0.1,
+        )
+        self._transfer_job_lease_owner = f"{dataplane_id}:{uuid4()}"
+        self._transfer_job_recovery_task: asyncio.Task[None] | None = None
+        self._transfer_job_recovery_stop = asyncio.Event()
+        self._transfer_job_recovery_wake = asyncio.Event()
+        self._transfer_job_heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
+        self._heartbeat_tasks_lock = asyncio.Lock()
+        self._service_running = False
         if isinstance(transfer_executor, _CompletionCallbackAwareTransferExecutor):
             transfer_executor.set_completion_callback(self._completed_from_runtime)
 
     async def startup(self) -> None:
         """Start optional background workers owned by this service."""
 
+        self._service_running = True
         dispatcher = self._callback_outbox_dispatcher
-        if dispatcher is None:
+        if dispatcher is not None:
+            await dispatcher.start()
+        if self._transfer_job_repository is None:
             return
-        await dispatcher.start()
+        task = self._transfer_job_recovery_task
+        if task is not None and not task.done():
+            return
+        self._transfer_job_recovery_stop.clear()
+        self._transfer_job_recovery_wake.set()
+        self._transfer_job_recovery_task = asyncio.create_task(
+            self._run_transfer_job_recovery_loop(),
+            name="transfer-job-recovery-loop",
+        )
 
     async def shutdown(self) -> None:
         """Stop optional background workers owned by this service."""
 
+        self._service_running = False
+        await self._stop_transfer_job_recovery_loop()
+        await self._stop_all_transfer_job_heartbeats()
         dispatcher = self._callback_outbox_dispatcher
-        if dispatcher is None:
-            return
-        await dispatcher.stop()
+        if dispatcher is not None:
+            await dispatcher.stop()
 
     async def prepare(self, message: DataFlowPrepareMessage) -> CommandResult:
         """Handle `/dataflows/prepare`."""
@@ -148,6 +196,11 @@ class DataFlowService:
         if self._is_async_requested(message.metadata, "Prepare"):
             data_flow.state = DataFlowState.PREPARING
             await self._repository.upsert(data_flow)
+            await self._upsert_transfer_job(
+                data_flow_id=data_flow.data_flow_id,
+                status=TransferJobStatus.QUEUED,
+            )
+            self._wake_transfer_job_recovery_loop()
             await self._publish_state_event(data_flow)
             return CommandResult(
                 status_code=202,
@@ -165,6 +218,10 @@ class DataFlowService:
             data_flow,
             response,
             callback_event_type=ControlPlaneCallbackEventType.PREPARED,
+        )
+        await self._upsert_transfer_job(
+            data_flow_id=data_flow.data_flow_id,
+            status=TransferJobStatus.COMPLETED,
         )
         await self._publish_state_event(data_flow)
         return CommandResult(status_code=200, body=response)
@@ -195,6 +252,11 @@ class DataFlowService:
         if self._is_async_requested(message.metadata, "Start"):
             data_flow.state = DataFlowState.STARTING
             await self._repository.upsert(data_flow)
+            await self._upsert_transfer_job(
+                data_flow_id=data_flow.data_flow_id,
+                status=TransferJobStatus.QUEUED,
+            )
+            self._wake_transfer_job_recovery_loop()
             await self._publish_state_event(data_flow)
             return CommandResult(
                 status_code=202,
@@ -213,6 +275,13 @@ class DataFlowService:
             response,
             callback_event_type=ControlPlaneCallbackEventType.STARTED,
         )
+        if transfer_mode is TransferMode.PUSH:
+            await self._mark_transfer_job_running(data_flow.data_flow_id)
+        else:
+            await self._upsert_transfer_job(
+                data_flow_id=data_flow.data_flow_id,
+                status=TransferJobStatus.COMPLETED,
+            )
         await self._publish_state_event(data_flow)
         return CommandResult(status_code=200, body=response)
 
@@ -250,6 +319,13 @@ class DataFlowService:
         data_flow.state = DataFlowState.STARTED
         data_flow.metadata[_STARTED_NOTIFICATION_SEEN_METADATA_KEY] = True
         await self._repository.upsert(data_flow)
+        if data_flow.transfer_mode is TransferMode.PULL:
+            await self._mark_transfer_job_running(data_flow.data_flow_id)
+        else:
+            await self._upsert_transfer_job(
+                data_flow_id=data_flow.data_flow_id,
+                status=TransferJobStatus.COMPLETED,
+            )
         await self._publish_state_event(data_flow)
 
     async def resume(
@@ -273,10 +349,12 @@ class DataFlowService:
         if message.data_address is not None:
             data_flow.data_address = message.data_address
 
+        execution_started = False
         if self._should_resume_via_started_notification(data_flow):
             started_message = self._resume_started_notification_message(data_flow)
             await self._transfer_executor.notify_started(data_flow, started_message)
             data_flow.metadata[_STARTED_NOTIFICATION_SEEN_METADATA_KEY] = True
+            execution_started = data_flow.transfer_mode is TransferMode.PULL
         else:
             if data_flow.transfer_mode is TransferMode.PUSH and data_flow.data_address is None:
                 raise DataFlowValidationError(
@@ -288,9 +366,17 @@ class DataFlowService:
             )
             if started_address is not None:
                 data_flow.data_address = started_address
+            execution_started = data_flow.transfer_mode is TransferMode.PUSH
 
         data_flow.state = DataFlowState.STARTED
         await self._repository.upsert(data_flow)
+        if execution_started:
+            await self._mark_transfer_job_running(data_flow.data_flow_id)
+        else:
+            await self._upsert_transfer_job(
+                data_flow_id=data_flow.data_flow_id,
+                status=TransferJobStatus.COMPLETED,
+            )
         await self._publish_state_event(data_flow)
         return TransferStartResponseMessage(data_address=data_flow.data_address)
 
@@ -307,6 +393,10 @@ class DataFlowService:
         await self._transfer_executor.suspend(data_flow, reason)
         data_flow.state = DataFlowState.SUSPENDED
         await self._repository.upsert(data_flow)
+        await self._upsert_transfer_job(
+            data_flow_id=data_flow.data_flow_id,
+            status=TransferJobStatus.PAUSED,
+        )
         await self._publish_state_event(data_flow)
 
     async def terminate(self, data_flow_id: str, reason: str | None) -> None:
@@ -330,6 +420,10 @@ class DataFlowService:
             response,
             callback_event_type=ControlPlaneCallbackEventType.ERRORED,
         )
+        await self._upsert_transfer_job(
+            data_flow_id=data_flow.data_flow_id,
+            status=TransferJobStatus.TERMINATED,
+        )
         await self._publish_state_event(data_flow)
 
     async def completed(self, data_flow_id: str) -> None:
@@ -352,6 +446,10 @@ class DataFlowService:
             data_flow,
             response,
             callback_event_type=ControlPlaneCallbackEventType.COMPLETED,
+        )
+        await self._upsert_transfer_job(
+            data_flow_id=data_flow.data_flow_id,
+            status=TransferJobStatus.COMPLETED,
         )
         await self._publish_state_event(data_flow)
 
@@ -530,6 +628,28 @@ class DataFlowService:
             labels=list(data_flow.labels),
             metadata=dict(data_flow.metadata),
             data_address=data_flow.data_address,
+        )
+
+    def _resume_prepare_message(self, data_flow: DataFlow) -> DataFlowPrepareMessage:
+        """Build a synthetic prepare message for recovery of PREPARING flows."""
+
+        callback_address = data_flow.callback_address
+        if callback_address is None:
+            raise DataFlowValidationError(
+                "Cannot recover prepare flow without callbackAddress persisted on the data flow."
+            )
+        return DataFlowPrepareMessage(
+            message_id=f"recover-prepare-{uuid4()}",
+            participant_id=data_flow.participant_id,
+            counter_party_id=data_flow.counter_party_id,
+            dataspace_context=data_flow.dataspace_context,
+            process_id=data_flow.process_id,
+            agreement_id=data_flow.agreement_id,
+            dataset_id=data_flow.dataset_id,
+            callback_address=callback_address,
+            transfer_type=data_flow.transfer_type,
+            labels=list(data_flow.labels),
+            metadata=dict(data_flow.metadata),
         )
 
     async def _to_data_flow_info(self, data_flow: DataFlow) -> DataFlowInfoResponse:
@@ -715,6 +835,11 @@ class DataFlowService:
             response,
             callback_event_type=ControlPlaneCallbackEventType.ERRORED,
         )
+        await self._upsert_transfer_job(
+            data_flow_id=data_flow.data_flow_id,
+            status=TransferJobStatus.FAILED,
+            last_error=error,
+        )
         await self._publish_state_event(data_flow)
         return data_flow
 
@@ -723,6 +848,312 @@ class DataFlowService:
 
         with suppress(DataFlowConflictError, DataFlowNotFoundError, DataFlowValidationError):
             await self.completed(data_flow_id)
+
+    async def _run_transfer_job_recovery_loop(self) -> None:
+        """Claim durable jobs and recover runtime execution after restarts."""
+
+        repository = self._transfer_job_repository
+        if repository is None:
+            return
+
+        while not self._transfer_job_recovery_stop.is_set():
+            processed = 0
+            try:
+                claimed_jobs = await repository.claim_due_transfer_jobs(
+                    lease_owner=self._transfer_job_lease_owner,
+                    limit=self._transfer_job_recovery_batch_size,
+                    lease_seconds=self._transfer_job_lease_seconds,
+                )
+                for claimed_job in claimed_jobs:
+                    processed += 1
+                    await self._recover_claimed_transfer_job(claimed_job.data_flow_id)
+            except Exception:
+                logger.exception("Transfer job recovery loop failed.")
+
+            if processed > 0:
+                continue
+
+            self._transfer_job_recovery_wake.clear()
+            try:
+                await asyncio.wait_for(
+                    self._transfer_job_recovery_wake.wait(),
+                    timeout=self._transfer_job_recovery_poll_seconds,
+                )
+            except TimeoutError:
+                pass
+
+    async def _recover_claimed_transfer_job(self, data_flow_id: str) -> None:
+        """Recover one claimed transfer job using persisted dataflow state."""
+
+        data_flow = await self._repository.get_by_data_flow_id(data_flow_id)
+        if data_flow is None:
+            await self._upsert_transfer_job(
+                data_flow_id=data_flow_id,
+                status=TransferJobStatus.FAILED,
+                last_error=f"No data flow found for recovery for id '{data_flow_id}'.",
+            )
+            return
+
+        try:
+            if data_flow.state is DataFlowState.PREPARING:
+                prepared_address = await self._transfer_executor.prepare(
+                    data_flow,
+                    self._resume_prepare_message(data_flow),
+                )
+                if prepared_address is not None:
+                    data_flow.data_address = prepared_address
+
+                data_flow.state = DataFlowState.PREPARED
+                response = self._response_message(data_flow)
+                await self._persist_transition_with_callback(
+                    data_flow,
+                    response,
+                    callback_event_type=ControlPlaneCallbackEventType.PREPARED,
+                )
+                await self._upsert_transfer_job(
+                    data_flow_id=data_flow.data_flow_id,
+                    status=TransferJobStatus.COMPLETED,
+                )
+                await self._publish_state_event(data_flow)
+                return
+
+            if data_flow.state is DataFlowState.STARTING:
+                started_address = await self._transfer_executor.start(
+                    data_flow,
+                    self._resume_start_message(data_flow),
+                )
+                if started_address is not None:
+                    data_flow.data_address = started_address
+
+                data_flow.state = DataFlowState.STARTED
+                response = self._response_message(data_flow)
+                await self._persist_transition_with_callback(
+                    data_flow,
+                    response,
+                    callback_event_type=ControlPlaneCallbackEventType.STARTED,
+                )
+                if data_flow.transfer_mode is TransferMode.PUSH:
+                    await self._mark_transfer_job_running(data_flow.data_flow_id)
+                else:
+                    await self._upsert_transfer_job(
+                        data_flow_id=data_flow.data_flow_id,
+                        status=TransferJobStatus.COMPLETED,
+                    )
+                await self._publish_state_event(data_flow)
+                return
+
+            if data_flow.state is DataFlowState.SUSPENDED:
+                await self._upsert_transfer_job(
+                    data_flow_id=data_flow.data_flow_id,
+                    status=TransferJobStatus.PAUSED,
+                )
+                return
+
+            if data_flow.state is DataFlowState.COMPLETED:
+                await self._upsert_transfer_job(
+                    data_flow_id=data_flow.data_flow_id,
+                    status=TransferJobStatus.COMPLETED,
+                )
+                return
+
+            if data_flow.state is DataFlowState.TERMINATED:
+                await self._upsert_transfer_job(
+                    data_flow_id=data_flow.data_flow_id,
+                    status=TransferJobStatus.TERMINATED,
+                )
+                return
+
+            if data_flow.state is not DataFlowState.STARTED:
+                await self._upsert_transfer_job(
+                    data_flow_id=data_flow.data_flow_id,
+                    status=TransferJobStatus.FAILED,
+                    last_error=(
+                        f"Transfer job recovery unsupported for state '{data_flow.state.value}'."
+                    ),
+                )
+                return
+
+            if self._should_resume_via_started_notification(data_flow):
+                started_message = self._resume_started_notification_message(data_flow)
+                await self._transfer_executor.notify_started(data_flow, started_message)
+                data_flow.metadata[_STARTED_NOTIFICATION_SEEN_METADATA_KEY] = True
+                await self._repository.upsert(data_flow)
+                if data_flow.transfer_mode is TransferMode.PULL:
+                    await self._mark_transfer_job_running(data_flow.data_flow_id)
+                else:
+                    await self._upsert_transfer_job(
+                        data_flow_id=data_flow.data_flow_id,
+                        status=TransferJobStatus.COMPLETED,
+                    )
+                return
+
+            if data_flow.transfer_mode is TransferMode.PUSH and data_flow.data_address is None:
+                raise DataFlowValidationError(
+                    "dataAddress is required to recover provider-push data flows."
+                )
+
+            started_address = await self._transfer_executor.start(
+                data_flow,
+                self._resume_start_message(data_flow),
+            )
+            if started_address is not None:
+                data_flow.data_address = started_address
+            await self._repository.upsert(data_flow)
+            if data_flow.transfer_mode is TransferMode.PUSH:
+                await self._mark_transfer_job_running(data_flow.data_flow_id)
+            else:
+                await self._upsert_transfer_job(
+                    data_flow_id=data_flow.data_flow_id,
+                    status=TransferJobStatus.COMPLETED,
+                )
+        except Exception as exc:  # noqa: BLE001
+            error_message = str(exc).strip() or "Transfer recovery failed."
+            logger.warning(
+                "Transfer job recovery failed for dataFlowId '%s': %s",
+                data_flow.data_flow_id,
+                error_message,
+            )
+            data_flow.state = DataFlowState.TERMINATED
+            response = self._response_message(data_flow, error=error_message)
+            await self._persist_transition_with_callback(
+                data_flow,
+                response,
+                callback_event_type=ControlPlaneCallbackEventType.ERRORED,
+            )
+            await self._upsert_transfer_job(
+                data_flow_id=data_flow.data_flow_id,
+                status=TransferJobStatus.FAILED,
+                last_error=error_message,
+            )
+            await self._publish_state_event(data_flow)
+
+    async def _stop_transfer_job_recovery_loop(self) -> None:
+        """Stop transfer-job recovery loop task."""
+
+        task = self._transfer_job_recovery_task
+        if task is None:
+            return
+        self._transfer_job_recovery_task = None
+        self._transfer_job_recovery_stop.set()
+        self._transfer_job_recovery_wake.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    def _wake_transfer_job_recovery_loop(self) -> None:
+        """Wake transfer-job loop so newly queued jobs can be recovered quickly."""
+
+        if self._transfer_job_repository is None:
+            return
+        self._transfer_job_recovery_wake.set()
+
+    async def _mark_transfer_job_running(self, data_flow_id: str) -> None:
+        """Mark one transfer job as running and start lease heartbeat."""
+
+        await self._upsert_transfer_job(
+            data_flow_id=data_flow_id,
+            status=TransferJobStatus.RUNNING,
+        )
+        await self._ensure_transfer_job_heartbeat(data_flow_id)
+
+    async def _upsert_transfer_job(
+        self,
+        *,
+        data_flow_id: str,
+        status: TransferJobStatus,
+        last_error: str | None = None,
+    ) -> None:
+        """Persist transfer job status when durable transfer-job storage is configured."""
+
+        repository = self._transfer_job_repository
+        if repository is None:
+            return
+        lease_owner = (
+            self._transfer_job_lease_owner if status is TransferJobStatus.RUNNING else None
+        )
+        lease_seconds = (
+            self._transfer_job_lease_seconds if status is TransferJobStatus.RUNNING else None
+        )
+        await repository.upsert_transfer_job(
+            data_flow_id=data_flow_id,
+            status=status,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+            last_error=last_error,
+        )
+        if status is not TransferJobStatus.RUNNING:
+            await self._stop_transfer_job_heartbeat(data_flow_id)
+
+    async def _ensure_transfer_job_heartbeat(self, data_flow_id: str) -> None:
+        """Ensure lease-heartbeat task exists for a running transfer job."""
+
+        if not self._service_running:
+            return
+        repository = self._transfer_job_repository
+        if repository is None:
+            return
+        _ = repository
+        async with self._heartbeat_tasks_lock:
+            existing = self._transfer_job_heartbeat_tasks.get(data_flow_id)
+            if existing is not None and not existing.done():
+                return
+            self._transfer_job_heartbeat_tasks[data_flow_id] = asyncio.create_task(
+                self._run_transfer_job_heartbeat(data_flow_id),
+                name=f"transfer-job-heartbeat-{data_flow_id}",
+            )
+
+    async def _run_transfer_job_heartbeat(self, data_flow_id: str) -> None:
+        """Refresh transfer-job lease ownership while runtime job is active."""
+
+        repository = self._transfer_job_repository
+        if repository is None:
+            return
+
+        try:
+            while self._service_running and not self._transfer_job_recovery_stop.is_set():
+                await asyncio.sleep(self._transfer_job_heartbeat_seconds)
+                renewed = await repository.renew_transfer_job_lease(
+                    data_flow_id=data_flow_id,
+                    lease_owner=self._transfer_job_lease_owner,
+                    lease_seconds=self._transfer_job_lease_seconds,
+                )
+                if not renewed:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Transfer job lease heartbeat failed for dataFlowId '%s'.",
+                data_flow_id,
+            )
+        finally:
+            async with self._heartbeat_tasks_lock:
+                task = self._transfer_job_heartbeat_tasks.get(data_flow_id)
+                if task is asyncio.current_task():
+                    self._transfer_job_heartbeat_tasks.pop(data_flow_id, None)
+
+    async def _stop_transfer_job_heartbeat(self, data_flow_id: str) -> None:
+        """Stop one lease-heartbeat task when transfer job leaves RUNNING."""
+
+        async with self._heartbeat_tasks_lock:
+            task = self._transfer_job_heartbeat_tasks.pop(data_flow_id, None)
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _stop_all_transfer_job_heartbeats(self) -> None:
+        """Stop all active transfer-job heartbeat tasks."""
+
+        async with self._heartbeat_tasks_lock:
+            tasks = list(self._transfer_job_heartbeat_tasks.values())
+            self._transfer_job_heartbeat_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 __all__ = ["CommandResult", "DataFlowService"]

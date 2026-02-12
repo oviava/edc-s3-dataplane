@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from simpl_bulk_dataplane.domain.callbacks import (
     ControlPlaneCallbackEvent,
@@ -18,6 +18,7 @@ from simpl_bulk_dataplane.domain.signaling_models import (
     DataFlowStartedNotificationMessage,
     DataFlowStartMessage,
 )
+from simpl_bulk_dataplane.domain.transfer_jobs import ClaimedTransferJob, TransferJobStatus
 
 
 class DataFlowRepository(Protocol):
@@ -66,6 +67,41 @@ class CallbackOutboxRepository(Protocol):
         next_attempt_at: datetime,
     ) -> None:
         """Record callback delivery failure and schedule next retry."""
+
+
+@runtime_checkable
+class TransferJobRepository(Protocol):
+    """Durable transfer execution job queue with lease-claim semantics."""
+
+    async def upsert_transfer_job(
+        self,
+        *,
+        data_flow_id: str,
+        status: TransferJobStatus,
+        lease_owner: str | None = None,
+        lease_seconds: float | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Create or update one durable transfer job row."""
+
+    async def claim_due_transfer_jobs(
+        self,
+        *,
+        lease_owner: str,
+        limit: int,
+        lease_seconds: float,
+    ) -> list[ClaimedTransferJob]:
+        """Claim due queued/running jobs for recovery and set lease ownership."""
+
+    async def renew_transfer_job_lease(
+        self,
+        *,
+        data_flow_id: str,
+        lease_owner: str,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend lease for one running transfer job owned by this worker."""
 
 
 class TransferExecutor(Protocol):
@@ -141,5 +177,6 @@ __all__ = [
     "ControlPlaneNotifier",
     "DataFlowEventPublisher",
     "DataFlowRepository",
+    "TransferJobRepository",
     "TransferExecutor",
 ]

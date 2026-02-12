@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     s3_max_active_dataflows: int = 4
     s3_max_pool_connections: int = 16
     s3_prefer_server_side_copy: bool = True
+    transfer_job_recovery_poll_seconds: float = 1.0
+    transfer_job_recovery_batch_size: int = 20
+    transfer_job_lease_seconds: float = 30.0
+    transfer_job_heartbeat_seconds: float = 10.0
     repository_backend: RepositoryBackend = RepositoryBackend.IN_MEMORY
     postgres_dsn: str | None = None
     postgres_pool_min_size: int = 1
@@ -102,6 +106,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SIMPL_DP_S3_MULTIPART_CONCURRENCY must be <= "
                 "SIMPL_DP_S3_MAX_POOL_CONNECTIONS."
+            )
+        if self.transfer_job_recovery_poll_seconds <= 0:
+            raise ValueError("SIMPL_DP_TRANSFER_JOB_RECOVERY_POLL_SECONDS must be > 0.")
+        if self.transfer_job_recovery_batch_size < 1:
+            raise ValueError("SIMPL_DP_TRANSFER_JOB_RECOVERY_BATCH_SIZE must be >= 1.")
+        if self.transfer_job_lease_seconds <= 0:
+            raise ValueError("SIMPL_DP_TRANSFER_JOB_LEASE_SECONDS must be > 0.")
+        if self.transfer_job_heartbeat_seconds <= 0:
+            raise ValueError("SIMPL_DP_TRANSFER_JOB_HEARTBEAT_SECONDS must be > 0.")
+        if self.transfer_job_heartbeat_seconds > self.transfer_job_lease_seconds:
+            raise ValueError(
+                "SIMPL_DP_TRANSFER_JOB_HEARTBEAT_SECONDS must be <= "
+                "SIMPL_DP_TRANSFER_JOB_LEASE_SECONDS."
             )
         return self
 

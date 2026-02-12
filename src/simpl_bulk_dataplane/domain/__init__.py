@@ -24,6 +24,7 @@ from simpl_bulk_dataplane.domain.ports import (
     ControlPlaneNotifier,
     DataFlowEventPublisher,
     DataFlowRepository,
+    TransferJobRepository,
     TransferExecutor,
 )
 from simpl_bulk_dataplane.domain.signaling_models import (
@@ -41,6 +42,7 @@ from simpl_bulk_dataplane.domain.signaling_models import (
     TransferStartResponseMessage,
 )
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState, TransferMode
+from simpl_bulk_dataplane.domain.transfer_jobs import ClaimedTransferJob, TransferJobStatus
 
 __all__ = [
     "CallbackOutboxRepository",
@@ -71,7 +73,10 @@ __all__ = [
     "EndpointProperty",
     "PendingControlPlaneCallbackEvent",
     "TransferStartResponseMessage",
+    "TransferJobRepository",
+    "TransferJobStatus",
     "TransferExecutor",
+    "ClaimedTransferJob",
     "TransferProgressSnapshot",
     "TransferMode",
     "UnsupportedTransferTypeError",
