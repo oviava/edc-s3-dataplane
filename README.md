@@ -193,9 +193,14 @@ Behavior:
 - Transfer execution is async and in-memory session based:
   - `start`/`notify_started` trigger background S3 copy tasks.
   - active transfer sessions are capped by `SIMPL_DP_S3_MAX_ACTIVE_DATAFLOWS` (default `4`); overflow flows wait in an internal queue.
+  - boto3 connection pooling is configurable via `SIMPL_DP_S3_MAX_POOL_CONNECTIONS` (default `16`).
+  - effective multipart concurrency is capped by the configured S3 pool size.
   - slot queueing is implemented as reusable runtime utility (`SlotBasedExecutionQueue`) for future non-S3 executors.
   - `suspend` pauses execution and a subsequent `start` resumes.
   - multipart copy is used for large objects or `forceMultipart=true`.
+  - when source and destination use the same S3 endpoint, transfers prefer server-side copy APIs (`copy_object` / `upload_part_copy`) to avoid payload relay through dataplane.
+  - server-side copy can be disabled via `SIMPL_DP_S3_PREFER_SERVER_SIDE_COPY=false`.
+  - runtime intentionally stays on `boto3` + bounded thread offload; evaluate async SDK migration only after profiling a real bottleneck.
   - Omitting `sourceKey` copies all objects in `sourceBucket` (bucket-to-bucket mode).
   - In bucket mode, `destinationKey` is optional and acts as a destination prefix when set.
 - Useful metadata keys for S3 execution:

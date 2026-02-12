@@ -52,6 +52,16 @@ def test_settings_require_positive_max_active_dataflows() -> None:
         Settings(s3_max_active_dataflows=0)
 
 
+def test_settings_require_positive_s3_max_pool_connections() -> None:
+    with pytest.raises(ValidationError):
+        Settings(s3_max_pool_connections=0)
+
+
+def test_settings_require_multipart_concurrency_not_exceed_pool() -> None:
+    with pytest.raises(ValidationError):
+        Settings(s3_multipart_concurrency=8, s3_max_pool_connections=4)
+
+
 def test_build_dataflow_service_uses_http_notifier_when_registration_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

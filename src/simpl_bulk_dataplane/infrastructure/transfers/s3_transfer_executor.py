@@ -7,7 +7,7 @@ import math
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 from urllib.parse import urlparse
 
 from pydantic import ValidationError
@@ -34,6 +34,9 @@ _DEFAULT_MULTIPART_THRESHOLD_MB = 8
 _DEFAULT_MULTIPART_PART_SIZE_MB = 8
 _DEFAULT_MULTIPART_CONCURRENCY = 4
 _DEFAULT_MAX_ACTIVE_DATAFLOWS = 4
+_DEFAULT_MAX_POOL_CONNECTIONS = 16
+
+_T = TypeVar("_T")
 
 
 class S3Client(Protocol):
@@ -62,6 +65,15 @@ class S3Client(Protocol):
     def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> dict[str, Any]:
         """Upload an object in a single call."""
 
+    def copy_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        CopySource: dict[str, str],
+    ) -> dict[str, Any]:
+        """Copy object server-side."""
+
     def create_multipart_upload(self, *, Bucket: str, Key: str) -> dict[str, Any]:
         """Start multipart upload."""
 
@@ -75,6 +87,18 @@ class S3Client(Protocol):
         Body: bytes,
     ) -> dict[str, Any]:
         """Upload one multipart segment."""
+
+    def upload_part_copy(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        UploadId: str,
+        PartNumber: int,
+        CopySource: dict[str, str],
+        CopySourceRange: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload one multipart segment using server-side copy."""
 
     def complete_multipart_upload(
         self,
@@ -164,6 +188,8 @@ class S3TransferExecutor(TransferExecutor):
         multipart_part_size_mb: int = _DEFAULT_MULTIPART_PART_SIZE_MB,
         multipart_concurrency: int = _DEFAULT_MULTIPART_CONCURRENCY,
         max_active_dataflows: int = _DEFAULT_MAX_ACTIVE_DATAFLOWS,
+        max_pool_connections: int = _DEFAULT_MAX_POOL_CONNECTIONS,
+        prefer_server_side_copy: bool = True,
         s3_client_factory: Callable[
             [str | None, str | None, bool, str | None, str | None, str | None],
             S3Client,
@@ -177,10 +203,17 @@ class S3TransferExecutor(TransferExecutor):
         part_size_mb = max(_MIN_MULTIPART_SIZE_MB, multipart_part_size_mb)
         self._multipart_threshold_bytes = threshold_mb * 1024 * 1024
         self._multipart_part_size_bytes = part_size_mb * 1024 * 1024
-        self._multipart_concurrency = max(1, multipart_concurrency)
+        self._max_pool_connections = max(1, max_pool_connections)
+        self._multipart_concurrency = min(max(1, multipart_concurrency), self._max_pool_connections)
+        self._prefer_server_side_copy = prefer_server_side_copy
         self._execution_queue = SlotBasedExecutionQueue(
             max_active_executions=max_active_dataflows
         )
+        blocking_io_limit = max(
+            self._max_pool_connections,
+            max_active_dataflows * self._multipart_concurrency,
+        )
+        self._blocking_io_semaphore = asyncio.Semaphore(max(1, blocking_io_limit))
         self._sessions: dict[str, TransferSession] = {}
         self._history: dict[str, TransferProgressSnapshot] = {}
         self._sessions_lock = asyncio.Lock()
@@ -201,6 +234,18 @@ class S3TransferExecutor(TransferExecutor):
         """Register callback invoked after successful runtime completion."""
 
         self._completion_callback = callback
+
+    async def _run_blocking(
+        self,
+        func: Callable[..., _T],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> _T:
+        """Run a blocking SDK call without stalling the event loop."""
+
+        async with self._blocking_io_semaphore:
+            return cast(_T, await asyncio.to_thread(func, *args, **kwargs))
 
     async def prepare(
         self, data_flow: DataFlow, message: DataFlowPrepareMessage
@@ -451,6 +496,7 @@ class S3TransferExecutor(TransferExecutor):
             destination_key=destination.key,
             size=size,
         )
+        can_use_server_side_copy = self._can_use_server_side_copy(source, destination)
 
         use_multipart = (
             session.plan.force_multipart
@@ -464,6 +510,8 @@ class S3TransferExecutor(TransferExecutor):
                 session=session,
                 source=source,
                 destination=destination,
+                size=size,
+                can_use_server_side_copy=can_use_server_side_copy,
             )
             self._mark_object_completed(session, source_key=source.key, size=size)
             return
@@ -475,6 +523,7 @@ class S3TransferExecutor(TransferExecutor):
             source=source,
             destination=destination,
             size=size,
+            can_use_server_side_copy=can_use_server_side_copy,
         )
         self._mark_object_completed(session, source_key=source.key, size=size)
 
@@ -485,26 +534,40 @@ class S3TransferExecutor(TransferExecutor):
         session: TransferSession,
         source: S3ObjectRef,
         destination: S3ObjectRef,
+        size: int,
+        can_use_server_side_copy: bool,
     ) -> None:
         """Copy object using single API call."""
 
         if destination.key is None:
             raise RuntimeError("Single-part copy requires destination key.")
 
+        if source.key is None:
+            raise RuntimeError("Single-part copy requires source key.")
+
         await self._wait_until_active(session)
-        source_payload = await self._read_source_payload(
-            source_client,
-            source,
-            part_range=None,
-        )
         session.bytes_transferred = session.completed_bytes
-        await asyncio.to_thread(
-            destination_client.put_object,
-            Bucket=destination.bucket,
-            Key=destination.key,
-            Body=source_payload,
-        )
-        session.bytes_transferred = session.completed_bytes + len(source_payload)
+        if can_use_server_side_copy:
+            await self._run_blocking(
+                destination_client.copy_object,
+                Bucket=destination.bucket,
+                Key=destination.key,
+                CopySource=self._build_copy_source(source),
+            )
+            session.bytes_transferred = session.completed_bytes + size
+        else:
+            source_payload = await self._read_source_payload(
+                source_client,
+                source,
+                part_range=None,
+            )
+            await self._run_blocking(
+                destination_client.put_object,
+                Bucket=destination.bucket,
+                Key=destination.key,
+                Body=source_payload,
+            )
+            session.bytes_transferred = session.completed_bytes + len(source_payload)
         await self._emit_progress(session.data_flow_id, self._snapshot_from_session(session))
 
     async def _copy_multipart(
@@ -515,6 +578,7 @@ class S3TransferExecutor(TransferExecutor):
         source: S3ObjectRef,
         destination: S3ObjectRef,
         size: int,
+        can_use_server_side_copy: bool,
     ) -> None:
         """Copy object with multipart upload and resumable part tracking."""
 
@@ -522,7 +586,7 @@ class S3TransferExecutor(TransferExecutor):
             raise RuntimeError("Multipart copy requires destination key.")
 
         if session.upload_id is None:
-            response = await asyncio.to_thread(
+            response = await self._run_blocking(
                 destination_client.create_multipart_upload,
                 Bucket=destination.bucket,
                 Key=destination.key,
@@ -555,6 +619,7 @@ class S3TransferExecutor(TransferExecutor):
                         part_number=part_number,
                         part_size=part_size,
                         object_size=size,
+                        can_use_server_side_copy=can_use_server_side_copy,
                     )
                     for part_number in batch
                 ]
@@ -567,7 +632,7 @@ class S3TransferExecutor(TransferExecutor):
             for number, etag in sorted(session.uploaded_parts.items())
         ]
         await self._wait_until_active(session)
-        await asyncio.to_thread(
+        await self._run_blocking(
             destination_client.complete_multipart_upload,
             Bucket=destination.bucket,
             Key=destination.key,
@@ -588,30 +653,48 @@ class S3TransferExecutor(TransferExecutor):
         part_number: int,
         part_size: int,
         object_size: int,
+        can_use_server_side_copy: bool,
     ) -> tuple[int, str]:
         """Copy one multipart segment and return part number + ETag."""
 
         if destination.key is None:
             raise RuntimeError("Multipart part copy requires destination key.")
 
+        if source.key is None:
+            raise RuntimeError("Multipart part copy requires source key.")
+
         assert session.upload_id is not None
         start = (part_number - 1) * part_size
         end = min(object_size - 1, start + part_size - 1)
 
-        payload = await self._read_source_payload(
-            source_client,
-            source,
-            part_range=(start, end),
-        )
-        response = await asyncio.to_thread(
-            destination_client.upload_part,
-            Bucket=destination.bucket,
-            Key=destination.key,
-            UploadId=session.upload_id,
-            PartNumber=part_number,
-            Body=payload,
-        )
-        session.uploaded_part_sizes[part_number] = len(payload)
+        part_length = (end - start) + 1
+        if can_use_server_side_copy:
+            response = await self._run_blocking(
+                destination_client.upload_part_copy,
+                Bucket=destination.bucket,
+                Key=destination.key,
+                UploadId=session.upload_id,
+                PartNumber=part_number,
+                CopySource=self._build_copy_source(source),
+                CopySourceRange=f"bytes={start}-{end}",
+            )
+        else:
+            payload = await self._read_source_payload(
+                source_client,
+                source,
+                part_range=(start, end),
+            )
+            response = await self._run_blocking(
+                destination_client.upload_part,
+                Bucket=destination.bucket,
+                Key=destination.key,
+                UploadId=session.upload_id,
+                PartNumber=part_number,
+                Body=payload,
+            )
+            part_length = len(payload)
+
+        session.uploaded_part_sizes[part_number] = part_length
         session.bytes_transferred = session.completed_bytes + sum(
             session.uploaded_part_sizes.values()
         )
@@ -674,7 +757,7 @@ class S3TransferExecutor(TransferExecutor):
             request_kwargs: dict[str, Any] = {"Bucket": bucket}
             if continuation_token is not None:
                 request_kwargs["ContinuationToken"] = continuation_token
-            response = await asyncio.to_thread(
+            response = await self._run_blocking(
                 source_client.list_objects_v2,
                 **request_kwargs,
             )
@@ -718,6 +801,34 @@ class S3TransferExecutor(TransferExecutor):
         if not normalized_prefix:
             return source_key
         return f"{normalized_prefix}/{source_key}"
+
+    def _build_copy_source(self, source: S3ObjectRef) -> dict[str, str]:
+        """Build CopySource payload for S3 server-side copy APIs."""
+
+        if source.key is None:
+            raise RuntimeError("Source key is required for server-side copy.")
+        return {"Bucket": source.bucket, "Key": source.key}
+
+    def _can_use_server_side_copy(
+        self,
+        source: S3ObjectRef,
+        destination: S3ObjectRef,
+    ) -> bool:
+        """Return True when source and destination can use server-side copy."""
+
+        if not self._prefer_server_side_copy:
+            return False
+        source_endpoint = self._normalize_endpoint_url(source.endpoint_url)
+        destination_endpoint = self._normalize_endpoint_url(destination.endpoint_url)
+        return source_endpoint == destination_endpoint
+
+    def _normalize_endpoint_url(self, endpoint_url: str | None) -> str | None:
+        """Normalize endpoint URL for equality checks."""
+
+        if endpoint_url is None:
+            return None
+        normalized = endpoint_url.strip().rstrip("/")
+        return normalized or None
 
     def _with_key(self, object_ref: S3ObjectRef, key: str) -> S3ObjectRef:
         """Clone object ref while preserving bucket/client configuration."""
@@ -781,7 +892,11 @@ class S3TransferExecutor(TransferExecutor):
 
         if source.key is None:
             raise RuntimeError("Source key is required for head_object.")
-        response = await asyncio.to_thread(client.head_object, Bucket=source.bucket, Key=source.key)
+        response = await self._run_blocking(
+            client.head_object,
+            Bucket=source.bucket,
+            Key=source.key,
+        )
         size = response.get("ContentLength")
         if not isinstance(size, int):
             raise RuntimeError("head_object did not return ContentLength")
@@ -802,7 +917,7 @@ class S3TransferExecutor(TransferExecutor):
             start, end = part_range
             range_header = f"bytes={start}-{end}"
 
-        response = await asyncio.to_thread(
+        response = await self._run_blocking(
             client.get_object,
             Bucket=source.bucket,
             Key=source.key,
@@ -811,7 +926,7 @@ class S3TransferExecutor(TransferExecutor):
         body = response.get("Body")
         if body is None:
             raise RuntimeError("get_object did not return Body")
-        payload = await asyncio.to_thread(self._read_stream_body, body)
+        payload = await self._run_blocking(self._read_stream_body, body)
         if not isinstance(payload, bytes):
             raise RuntimeError("get_object Body did not resolve to bytes")
         return payload
@@ -859,7 +974,7 @@ class S3TransferExecutor(TransferExecutor):
             session.plan.destination.session_token,
         )
         with suppress(Exception):
-            await asyncio.to_thread(
+            await self._run_blocking(
                 client.abort_multipart_upload,
                 Bucket=session.plan.destination.bucket,
                 Key=session.active_destination_key,
@@ -952,13 +1067,14 @@ class S3TransferExecutor(TransferExecutor):
             key="multipartConcurrency",
             fallback=self._multipart_concurrency,
         )
+        concurrency = min(self._max_pool_connections, max(1, concurrency))
 
         return S3TransferPlan(
             source=source,
             destination=destination,
             multipart_threshold_bytes=threshold_mb * 1024 * 1024,
             multipart_part_size_bytes=part_size_mb * 1024 * 1024,
-            multipart_concurrency=max(1, concurrency),
+            multipart_concurrency=concurrency,
             force_multipart=bool(metadata.get("forceMultipart") is True),
         )
 
@@ -1327,8 +1443,10 @@ class S3TransferExecutor(TransferExecutor):
         client_kwargs: dict[str, object] = {"region_name": resolved_region}
         if endpoint_url:
             client_kwargs["endpoint_url"] = endpoint_url
+        config_kwargs: dict[str, Any] = {"max_pool_connections": self._max_pool_connections}
         if force_path_style:
-            client_kwargs["config"] = Config(s3={"addressing_style": "path"})
+            config_kwargs["s3"] = {"addressing_style": "path"}
+        client_kwargs["config"] = Config(**config_kwargs)
         if access_key_id is not None:
             client_kwargs["aws_access_key_id"] = access_key_id
         if secret_access_key is not None:

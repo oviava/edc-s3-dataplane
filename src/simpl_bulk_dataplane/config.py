@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     s3_multipart_part_size_mb: int = 8
     s3_multipart_concurrency: int = 4
     s3_max_active_dataflows: int = 4
+    s3_max_pool_connections: int = 16
+    s3_prefer_server_side_copy: bool = True
     repository_backend: RepositoryBackend = RepositoryBackend.IN_MEMORY
     postgres_dsn: str | None = None
     postgres_pool_min_size: int = 1
@@ -92,6 +94,15 @@ class Settings(BaseSettings):
             raise ValueError("SIMPL_DP_CONTROL_PLANE_TIMEOUT_SECONDS must be > 0.")
         if self.s3_max_active_dataflows < 1:
             raise ValueError("SIMPL_DP_S3_MAX_ACTIVE_DATAFLOWS must be >= 1.")
+        if self.s3_multipart_concurrency < 1:
+            raise ValueError("SIMPL_DP_S3_MULTIPART_CONCURRENCY must be >= 1.")
+        if self.s3_max_pool_connections < 1:
+            raise ValueError("SIMPL_DP_S3_MAX_POOL_CONNECTIONS must be >= 1.")
+        if self.s3_multipart_concurrency > self.s3_max_pool_connections:
+            raise ValueError(
+                "SIMPL_DP_S3_MULTIPART_CONCURRENCY must be <= "
+                "SIMPL_DP_S3_MAX_POOL_CONNECTIONS."
+            )
         return self
 
     model_config = SettingsConfigDict(env_prefix="SIMPL_DP_", extra="ignore")

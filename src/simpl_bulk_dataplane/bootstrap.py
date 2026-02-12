@@ -160,6 +160,8 @@ def build_dataflow_service(settings: Settings) -> DataFlowService:
             multipart_part_size_mb=settings.s3_multipart_part_size_mb,
             multipart_concurrency=settings.s3_multipart_concurrency,
             max_active_dataflows=settings.s3_max_active_dataflows,
+            max_pool_connections=settings.s3_max_pool_connections,
+            prefer_server_side_copy=settings.s3_prefer_server_side_copy,
             progress_callback=progress_callback,
         ),
         control_plane_notifier=_build_control_plane_notifier(settings),

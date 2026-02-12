@@ -33,8 +33,11 @@ class FakeS3Client:
         self._multipart_uploads: dict[str, tuple[str, str, dict[int, bytes]]] = {}
         self._lock = threading.Lock()
         self.put_calls = 0
+        self.copy_calls = 0
         self.get_calls = 0
         self.multipart_upload_calls = 0
+        self.upload_part_calls = 0
+        self.upload_part_copy_calls = 0
         self.uploaded_part_numbers: list[int] = []
         self.complete_calls = 0
         self.abort_calls = 0
@@ -72,6 +75,21 @@ class FakeS3Client:
             self.put_calls += 1
             self._objects[(Bucket, Key)] = Body
         return {"ETag": "etag-single-part"}
+
+    def copy_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        CopySource: dict[str, str],
+    ) -> dict[str, Any]:
+        if self._put_delay_seconds:
+            time.sleep(self._put_delay_seconds)
+        source_bucket, source_key = self._parse_copy_source(CopySource)
+        with self._lock:
+            self.copy_calls += 1
+            self._objects[(Bucket, Key)] = self._objects[(source_bucket, source_key)]
+        return {"CopyObjectResult": {"ETag": "etag-copy"}}
 
     def list_objects_v2(
         self,
@@ -120,12 +138,44 @@ class FakeS3Client:
         if self._part_delay_seconds:
             time.sleep(self._part_delay_seconds)
         with self._lock:
+            self.upload_part_calls += 1
             upload_bucket, upload_key, parts = self._multipart_uploads[UploadId]
             assert upload_bucket == Bucket
             assert upload_key == Key
             parts[PartNumber] = Body
             self.uploaded_part_numbers.append(PartNumber)
         return {"ETag": f"etag-{PartNumber}"}
+
+    def upload_part_copy(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        UploadId: str,
+        PartNumber: int,
+        CopySource: dict[str, str],
+        CopySourceRange: str | None = None,
+    ) -> dict[str, Any]:
+        if self._part_delay_seconds:
+            time.sleep(self._part_delay_seconds)
+        source_bucket, source_key = self._parse_copy_source(CopySource)
+        payload = self._objects[(source_bucket, source_key)]
+        if CopySourceRange is not None:
+            prefix = "bytes="
+            if not CopySourceRange.startswith(prefix):
+                raise ValueError(f"Unsupported copy range: {CopySourceRange}")
+            start_str, end_str = CopySourceRange[len(prefix) :].split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            payload = payload[start : end + 1]
+        with self._lock:
+            self.upload_part_copy_calls += 1
+            upload_bucket, upload_key, parts = self._multipart_uploads[UploadId]
+            assert upload_bucket == Bucket
+            assert upload_key == Key
+            parts[PartNumber] = payload
+            self.uploaded_part_numbers.append(PartNumber)
+        return {"CopyPartResult": {"ETag": f"etag-{PartNumber}"}}
 
     def complete_multipart_upload(
         self,
@@ -149,6 +199,11 @@ class FakeS3Client:
             self.abort_calls += 1
             self._multipart_uploads.pop(UploadId, None)
         return {}
+
+    def _parse_copy_source(self, copy_source: dict[str, str]) -> tuple[str, str]:
+        source_bucket = copy_source["Bucket"]
+        source_key = copy_source["Key"]
+        return source_bucket, source_key
 
 
 def _build_data_flow(process_id: str) -> DataFlow:
@@ -213,6 +268,8 @@ def test_push_start_uses_multipart_copy_async() -> None:
     asyncio.run(scenario())
 
     assert fake_client.put_calls == 0
+    assert fake_client.upload_part_calls == 0
+    assert fake_client.upload_part_copy_calls == 3
     assert fake_client.multipart_upload_calls == 1
     assert sorted(fake_client.uploaded_part_numbers) == [1, 2, 3]
     assert fake_client.complete_calls == 1
@@ -245,7 +302,8 @@ def test_push_start_emits_completion_callback_after_successful_copy() -> None:
     asyncio.run(scenario())
 
     assert completions == [data_flow.data_flow_id]
-    assert fake_client.put_calls == 1
+    assert fake_client.copy_calls == 1
+    assert fake_client.put_calls == 0
 
 
 def test_suspend_then_resume_continues_multipart_transfer() -> None:
@@ -361,6 +419,45 @@ def test_start_uses_dataaddress_credentials_for_s3_clients() -> None:
     assert destination_call[2] is True
     assert destination_call[3] == "dst-ak"
     assert destination_call[4] == "dst-sk"
+    assert fake_client.put_calls == 1
+    assert fake_client.copy_calls == 0
+
+
+def test_multipart_falls_back_to_stream_copy_when_endpoints_differ() -> None:
+    fake_client = FakeS3Client({("src-bucket", "source.bin"): 13 * 1024 * 1024})
+    executor = S3TransferExecutor(
+        multipart_threshold_mb=5,
+        multipart_part_size_mb=5,
+        s3_client_factory=lambda *_: fake_client,
+    )
+
+    data_flow = _build_data_flow("multipart-fallback")
+    message = _build_start_message("multipart-fallback").model_copy(
+        update={
+            "metadata": {
+                "sourceBucket": "src-bucket",
+                "sourceKey": "source.bin",
+                "sourceEndpointUrl": "http://source-minio:9000",
+            },
+            "data_address": DataAddress(
+                type_="DataAddress",
+                endpoint_type="urn:aws:s3",
+                endpoint="s3://dst-bucket/result.bin",
+                endpoint_properties=[
+                    EndpointProperty(name="endpointUrl", value="http://dest-minio:9000"),
+                ],
+            ),
+        }
+    )
+
+    async def scenario() -> None:
+        await executor.start(data_flow, message)
+        await executor.complete(data_flow)
+
+    asyncio.run(scenario())
+
+    assert fake_client.upload_part_calls == 3
+    assert fake_client.upload_part_copy_calls == 0
 
 
 def test_bucket_to_bucket_without_source_key_supports_suspend_resume() -> None:
