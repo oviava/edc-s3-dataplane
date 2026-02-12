@@ -192,6 +192,8 @@ Behavior:
 - Models mirror `docs/docs/schemas/*.json` with Pydantic aliases for DPS JSON field names.
 - Transfer execution is async and in-memory session based:
   - `start`/`notify_started` trigger background S3 copy tasks.
+  - active transfer sessions are capped by `SIMPL_DP_S3_MAX_ACTIVE_DATAFLOWS` (default `4`); overflow flows wait in an internal queue.
+  - slot queueing is implemented as reusable runtime utility (`SlotBasedExecutionQueue`) for future non-S3 executors.
   - `suspend` pauses execution and a subsequent `start` resumes.
   - multipart copy is used for large objects or `forceMultipart=true`.
   - Omitting `sourceKey` copies all objects in `sourceBucket` (bucket-to-bucket mode).

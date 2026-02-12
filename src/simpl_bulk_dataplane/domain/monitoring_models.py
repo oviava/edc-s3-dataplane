@@ -16,6 +16,7 @@ class TransferProgressSnapshot:
     bytes_total: int | None = None
     bytes_transferred: int = 0
     running: bool = False
+    queued: bool = False
     paused: bool = False
     finished: bool = False
     last_error: str | None = None
@@ -43,6 +44,7 @@ class DataFlowProgressResponse(MonitoringModel):
     bytes_transferred: int = Field(default=0, alias="bytesTransferred")
     percent_complete: float | None = Field(default=None, alias="percentComplete")
     running: bool = False
+    queued: bool = False
     paused: bool = False
     finished: bool = False
     last_error: str | None = Field(default=None, alias="lastError")

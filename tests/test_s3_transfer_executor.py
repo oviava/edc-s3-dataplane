@@ -19,12 +19,16 @@ class FakeS3Client:
     """Thread-safe fake S3 client used by transfer executor tests."""
 
     def __init__(
-        self, object_sizes: dict[tuple[str, str], int], part_delay_seconds: float = 0.0
+        self,
+        object_sizes: dict[tuple[str, str], int],
+        part_delay_seconds: float = 0.0,
+        put_delay_seconds: float = 0.0,
     ) -> None:
         self._objects = {
             object_ref: b"x" * size for object_ref, size in object_sizes.items()
         }
         self._part_delay_seconds = part_delay_seconds
+        self._put_delay_seconds = put_delay_seconds
         self._upload_counter = 0
         self._multipart_uploads: dict[str, tuple[str, str, dict[int, bytes]]] = {}
         self._lock = threading.Lock()
@@ -62,6 +66,8 @@ class FakeS3Client:
         return {"Body": payload[start : end + 1]}
 
     def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> dict[str, Any]:
+        if self._put_delay_seconds:
+            time.sleep(self._put_delay_seconds)
         with self._lock:
             self.put_calls += 1
             self._objects[(Bucket, Key)] = Body
@@ -465,3 +471,58 @@ def test_bucket_to_bucket_uses_destination_key_prefix() -> None:
     assert fake_client._objects[("dst-bucket", "archive/b/file-2.txt")] == fake_client._objects[
         ("src-bucket", "b/file-2.txt")
     ]
+
+
+def test_start_queues_when_max_active_dataflows_limit_is_reached() -> None:
+    fake_client = FakeS3Client(
+        {("src-bucket", "source.bin"): 2 * 1024 * 1024},
+        put_delay_seconds=0.3,
+    )
+    executor = S3TransferExecutor(
+        multipart_threshold_mb=8,
+        multipart_part_size_mb=8,
+        max_active_dataflows=1,
+        s3_client_factory=lambda *_: fake_client,
+    )
+
+    flow_a = _build_data_flow("queue-a")
+    message_a = _build_start_message("queue-a").model_copy(
+        update={
+            "data_address": DataAddress(
+                type_="DataAddress",
+                endpoint_type="urn:aws:s3",
+                endpoint="s3://dst-bucket/result-a.bin",
+                endpoint_properties=[],
+            )
+        }
+    )
+    flow_b = _build_data_flow("queue-b")
+    message_b = _build_start_message("queue-b").model_copy(
+        update={
+            "data_address": DataAddress(
+                type_="DataAddress",
+                endpoint_type="urn:aws:s3",
+                endpoint="s3://dst-bucket/result-b.bin",
+                endpoint_properties=[],
+            )
+        }
+    )
+
+    async def scenario() -> None:
+        await executor.start(flow_a, message_a)
+        await executor.start(flow_b, message_b)
+        await asyncio.sleep(0.05)
+
+        progress_a = await executor.get_progress(flow_a.data_flow_id)
+        progress_b = await executor.get_progress(flow_b.data_flow_id)
+        assert progress_a is not None
+        assert progress_b is not None
+        assert progress_a.running is True
+        assert progress_a.queued is False
+        assert progress_b.running is False
+        assert progress_b.queued is True
+
+        await executor.complete(flow_a)
+        await executor.complete(flow_b)
+
+    asyncio.run(scenario())

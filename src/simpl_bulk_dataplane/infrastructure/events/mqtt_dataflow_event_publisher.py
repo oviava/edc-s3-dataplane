@@ -168,6 +168,7 @@ class MqttDataFlowEventPublisher(DataFlowEventPublisher):
             "bytesTransferred": progress.bytes_transferred,
             "percentComplete": progress.percent_complete,
             "running": progress.running,
+            "queued": progress.queued,
             "paused": progress.paused,
             "finished": progress.finished,
             "lastError": progress.last_error,

@@ -24,11 +24,16 @@ from simpl_bulk_dataplane.domain.signaling_models import (
     EndpointProperty,
 )
 from simpl_bulk_dataplane.domain.transfer_types import TransferMode
+from simpl_bulk_dataplane.infrastructure.transfers.runtime import (
+    QueueExecutionControl,
+    SlotBasedExecutionQueue,
+)
 
 _MIN_MULTIPART_SIZE_MB = 5
 _DEFAULT_MULTIPART_THRESHOLD_MB = 8
 _DEFAULT_MULTIPART_PART_SIZE_MB = 8
 _DEFAULT_MULTIPART_CONCURRENCY = 4
+_DEFAULT_MAX_ACTIVE_DATAFLOWS = 4
 
 
 class S3Client(Protocol):
@@ -126,8 +131,7 @@ class TransferSession:
 
     data_flow_id: str
     plan: S3TransferPlan
-    pause_event: asyncio.Event = field(default_factory=asyncio.Event)
-    terminate_event: asyncio.Event = field(default_factory=asyncio.Event)
+    execution_control: QueueExecutionControl = field(default_factory=QueueExecutionControl)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     task: asyncio.Task[None] | None = None
     upload_id: str | None = None
@@ -142,9 +146,6 @@ class TransferSession:
     active_object_size_bytes: int | None = None
     finished: bool = False
     last_error: str | None = None
-
-    def __post_init__(self) -> None:
-        self.pause_event.set()
 
 
 class S3TransferExecutor(TransferExecutor):
@@ -162,6 +163,7 @@ class S3TransferExecutor(TransferExecutor):
         multipart_threshold_mb: int = _DEFAULT_MULTIPART_THRESHOLD_MB,
         multipart_part_size_mb: int = _DEFAULT_MULTIPART_PART_SIZE_MB,
         multipart_concurrency: int = _DEFAULT_MULTIPART_CONCURRENCY,
+        max_active_dataflows: int = _DEFAULT_MAX_ACTIVE_DATAFLOWS,
         s3_client_factory: Callable[
             [str | None, str | None, bool, str | None, str | None, str | None],
             S3Client,
@@ -176,12 +178,21 @@ class S3TransferExecutor(TransferExecutor):
         self._multipart_threshold_bytes = threshold_mb * 1024 * 1024
         self._multipart_part_size_bytes = part_size_mb * 1024 * 1024
         self._multipart_concurrency = max(1, multipart_concurrency)
+        self._execution_queue = SlotBasedExecutionQueue(
+            max_active_executions=max_active_dataflows
+        )
         self._sessions: dict[str, TransferSession] = {}
         self._history: dict[str, TransferProgressSnapshot] = {}
         self._sessions_lock = asyncio.Lock()
         self._s3_client_factory = s3_client_factory or self._build_default_s3_client
         self._progress_callback = progress_callback
         self._completion_callback = completion_callback
+
+    @property
+    def max_active_dataflows(self) -> int:
+        """Return runtime cap for concurrently active transfer sessions."""
+
+        return self._execution_queue.max_active_executions
 
     def set_completion_callback(
         self,
@@ -263,7 +274,8 @@ class S3TransferExecutor(TransferExecutor):
         session = self._sessions.get(data_flow.data_flow_id)
         if session is None or session.finished:
             return
-        session.pause_event.clear()
+        session.execution_control.pause_event.clear()
+        await self._execution_queue.mark_not_waiting(session.execution_control)
         await self._emit_progress(data_flow.data_flow_id, self._snapshot_from_session(session))
 
     async def terminate(self, data_flow: DataFlow, reason: str | None) -> None:
@@ -274,13 +286,15 @@ class S3TransferExecutor(TransferExecutor):
         if session is None:
             return
 
-        session.terminate_event.set()
-        session.pause_event.set()
+        session.execution_control.terminate_event.set()
+        session.execution_control.pause_event.set()
 
         if session.task is not None and not session.task.done():
             session.task.cancel()
             with suppress(asyncio.CancelledError):
                 await session.task
+        self._release_execution_slot(session)
+        await self._execution_queue.mark_not_waiting(session.execution_control)
 
         if session.upload_id is not None and not session.finished:
             await self._abort_multipart(session)
@@ -326,8 +340,8 @@ class S3TransferExecutor(TransferExecutor):
             else:
                 session.plan = plan
 
-            session.pause_event.set()
-            session.terminate_event.clear()
+            session.execution_control.pause_event.set()
+            session.execution_control.terminate_event.clear()
             await self._emit_progress(data_flow_id, self._snapshot_from_session(session))
 
             if session.finished:
@@ -361,6 +375,8 @@ class S3TransferExecutor(TransferExecutor):
             except Exception as exc:  # noqa: BLE001
                 session.last_error = str(exc)
             finally:
+                self._release_execution_slot(session)
+                await self._execution_queue.mark_not_waiting(session.execution_control)
                 await self._emit_progress(
                     session.data_flow_id,
                     self._snapshot_from_session(session),
@@ -371,6 +387,7 @@ class S3TransferExecutor(TransferExecutor):
     async def _execute_plan(self, session: TransferSession) -> None:
         """Run copy workflow for one object or all objects in a source bucket."""
 
+        await self._wait_until_active(session)
         source_client = self._s3_client_factory(
             session.plan.source.region or self._default_region,
             session.plan.source.endpoint_url,
@@ -812,14 +829,20 @@ class S3TransferExecutor(TransferExecutor):
         raise RuntimeError("S3 response body is not readable")
 
     async def _wait_until_active(self, session: TransferSession) -> None:
-        """Pause transfer loop while suspended."""
+        """Wait until transfer session is active and has a queue slot."""
 
-        while True:
-            if session.terminate_event.is_set():
-                raise asyncio.CancelledError
-            if session.pause_event.is_set():
-                return
-            await asyncio.sleep(0.05)
+        async def on_queue_state_change() -> None:
+            await self._emit_progress(session.data_flow_id, self._snapshot_from_session(session))
+
+        await self._execution_queue.wait_until_active(
+            session.execution_control,
+            on_queue_state_change=on_queue_state_change,
+        )
+
+    def _release_execution_slot(self, session: TransferSession) -> None:
+        """Release transfer slot when the session no longer actively copies."""
+
+        self._execution_queue.release(session.execution_control)
 
     async def _abort_multipart(self, session: TransferSession) -> None:
         """Abort in-flight multipart upload on terminate."""
@@ -852,12 +875,21 @@ class S3TransferExecutor(TransferExecutor):
     def _snapshot_from_session(self, session: TransferSession) -> TransferProgressSnapshot:
         """Build a read-safe progress payload from runtime state."""
 
-        task_running = session.task is not None and not session.task.done() and not session.finished
+        task_active = session.task is not None and not session.task.done() and not session.finished
         return TransferProgressSnapshot(
             bytes_total=session.object_size_bytes,
             bytes_transferred=session.bytes_transferred,
-            running=task_running,
-            paused=(task_running and not session.pause_event.is_set()),
+            running=(
+                task_active
+                and session.execution_control.pause_event.is_set()
+                and session.execution_control.slot_acquired
+            ),
+            queued=(
+                task_active
+                and session.execution_control.pause_event.is_set()
+                and session.execution_control.waiting_for_slot
+            ),
+            paused=(task_active and not session.execution_control.pause_event.is_set()),
             finished=session.finished,
             last_error=session.last_error,
         )

@@ -17,6 +17,7 @@ from simpl_bulk_dataplane.infrastructure.repositories import (
     InMemoryDataFlowRepository,
     PostgresDataFlowRepository,
 )
+from simpl_bulk_dataplane.infrastructure.transfers import S3TransferExecutor
 
 
 def test_build_dataflow_service_uses_in_memory_repository_by_default() -> None:
@@ -44,6 +45,11 @@ def test_settings_require_postgres_dsn_when_backend_is_postgres() -> None:
 def test_settings_require_mqtt_host_when_mqtt_events_are_enabled() -> None:
     with pytest.raises(ValidationError):
         Settings(dataflow_events_mqtt_enabled=True)
+
+
+def test_settings_require_positive_max_active_dataflows() -> None:
+    with pytest.raises(ValidationError):
+        Settings(s3_max_active_dataflows=0)
 
 
 def test_build_dataflow_service_uses_http_notifier_when_registration_succeeds(
@@ -80,3 +86,11 @@ def test_build_dataflow_service_falls_back_to_noop_notifier_when_registration_fa
     service = build_dataflow_service(settings)
 
     assert isinstance(service._control_plane_notifier, NoopControlPlaneNotifier)
+
+
+def test_build_dataflow_service_applies_max_active_dataflow_limit() -> None:
+    settings = Settings(s3_max_active_dataflows=2)
+    service = build_dataflow_service(settings)
+
+    assert isinstance(service._transfer_executor, S3TransferExecutor)
+    assert service._transfer_executor.max_active_dataflows == 2
