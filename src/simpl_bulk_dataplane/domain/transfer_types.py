@@ -8,7 +8,7 @@ from simpl_bulk_dataplane.domain.errors import UnsupportedTransferTypeError
 class DataFlowState(StrEnum):
     """Supported data flow states."""
 
-    UNINITIALIZED = "UNINITIALIZED"
+    INITIALIZED = "INITIALIZED"
     PREPARING = "PREPARING"
     PREPARED = "PREPARED"
     STARTING = "STARTING"

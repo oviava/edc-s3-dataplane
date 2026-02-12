@@ -193,6 +193,11 @@ class PostgresDataFlowRepository(DataFlowRepository):
         labels = self._decode_list(row["labels"])
         metadata = self._decode_dict(row["metadata"])
 
+        state_literal = str(row["state"])
+        if state_literal == "UNINITIALIZED":
+            # Backward compatibility for rows persisted before INITIALIZED rename.
+            state_literal = DataFlowState.INITIALIZED.value
+
         return DataFlow(
             data_flow_id=str(row["data_flow_id"]),
             process_id=str(row["process_id"]),
@@ -204,7 +209,7 @@ class PostgresDataFlowRepository(DataFlowRepository):
             agreement_id=str(row["agreement_id"]),
             dataset_id=str(row["dataset_id"]),
             callback_address=self._as_optional_str(row["callback_address"]),
-            state=DataFlowState(str(row["state"])),
+            state=DataFlowState(state_literal),
             data_address=data_address,
             labels=labels,
             metadata=metadata,

@@ -23,7 +23,7 @@ class DataFlow:
     agreement_id: str
     dataset_id: str
     callback_address: str | None
-    state: DataFlowState = DataFlowState.UNINITIALIZED
+    state: DataFlowState = DataFlowState.INITIALIZED
     data_address: DataAddress | None = None
     labels: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)

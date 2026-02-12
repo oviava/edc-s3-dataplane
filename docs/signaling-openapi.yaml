@@ -670,7 +670,7 @@ components:
         state:
           type: string
           description: The state of the data flow. Only PREPARING and PREPARED are valid in the response to a prepare request.
-          enum: [ UNINITIALIZED, PREPARING, PREPARED, STARTING, STARTED, COMPLETED, SUSPENDED, TERMINATED ]
+          enum: [ INITIALIZED, PREPARING, PREPARED, STARTING, STARTED, COMPLETED, SUSPENDED, TERMINATED ]
           example: PREPARED
         dataAddress:
           $ref: '#/components/schemas/DataAddress'
@@ -689,7 +689,7 @@ components:
         state:
           type: string
           description: The current state of the data flow.
-          enum: [ UNINITIALIZED, PREPARING, PREPARED, STARTING, STARTED, COMPLETED, SUSPENDED, TERMINATED ]
+          enum: [ INITIALIZED, PREPARING, PREPARED, STARTING, STARTED, COMPLETED, SUSPENDED, TERMINATED ]
 
     DataAddress:
       type: object

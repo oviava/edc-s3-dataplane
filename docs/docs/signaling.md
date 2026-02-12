@@ -101,7 +101,7 @@ the efficient handling of long-running processes. All other transitions MUST be 
 
 ### Synchronous Operation
 
-In many scenarios, a [=Data Plane=] MAY immediately transition from its INITIAL state to either the STARTED or PREPARED
+In many scenarios, a [=Data Plane=] MAY immediately transition from its INITIALIZED state to either the STARTED or PREPARED
 state. In these cases, the transitions happen synchronously and can be represented in compact form as follows:
 
 ```mermaid
