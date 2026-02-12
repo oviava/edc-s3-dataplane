@@ -284,12 +284,6 @@ def test_transfer_100mb_with_suspend_resume_across_two_dataplanes(docker_stack: 
         timeout_seconds=180.0,
     )
     assert _object_sha256(destination_client, DEST_BUCKET, DEST_KEY) == expected_sha
-
-    completed_response = httpx.post(
-        f"{DATAPLANE_A_URL}/dataflows/{data_flow_id_a}/completed",
-        timeout=30.0,
-    )
-    assert completed_response.status_code == 200, completed_response.text
     _wait_for_state(DATAPLANE_A_URL, data_flow_id_a, "COMPLETED", timeout_seconds=30.0)
 
     process_id_b = f"proc-b-{uuid4()}"
@@ -313,10 +307,4 @@ def test_transfer_100mb_with_suspend_resume_across_two_dataplanes(docker_stack: 
         timeout_seconds=180.0,
     )
     assert _object_sha256(source_client, SOURCE_BUCKET, RETURN_KEY) == expected_sha
-
-    completed_response_b = httpx.post(
-        f"{DATAPLANE_B_URL}/dataflows/{data_flow_id_b}/completed",
-        timeout=30.0,
-    )
-    assert completed_response_b.status_code == 200, completed_response_b.text
     _wait_for_state(DATAPLANE_B_URL, data_flow_id_b, "COMPLETED", timeout_seconds=30.0)

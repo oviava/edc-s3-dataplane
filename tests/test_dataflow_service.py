@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 
 import pytest
 
 from simpl_bulk_dataplane.application.services import DataFlowService
+from simpl_bulk_dataplane.domain.entities import DataFlow
 from simpl_bulk_dataplane.domain.errors import DataFlowConflictError, DataFlowValidationError
 from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
 from simpl_bulk_dataplane.domain.ports import TransferExecutor
@@ -139,12 +141,11 @@ class FailingProgressTransferExecutor(RecordingTransferExecutor):
 
     async def start(
         self,
-        data_flow: object,
+        data_flow: DataFlow,
         message: DataFlowStartMessage,
     ) -> DataAddress | None:
-        assert hasattr(data_flow, "data_flow_id")
         self.start_messages.append(message)
-        flow_id = str(getattr(data_flow, "data_flow_id"))
+        flow_id = data_flow.data_flow_id
         self._progress_by_flow[flow_id] = TransferProgressSnapshot(
             bytes_total=None,
             bytes_transferred=0,
@@ -157,6 +158,25 @@ class FailingProgressTransferExecutor(RecordingTransferExecutor):
 
     async def get_progress(self, data_flow_id: str) -> TransferProgressSnapshot | None:
         return self._progress_by_flow.get(data_flow_id)
+
+
+class CompletionAwareTransferExecutor(RecordingTransferExecutor):
+    """Test double exposing runtime completion callback registration."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._completion_callback: Callable[[str], Awaitable[None]] | None = None
+
+    def set_completion_callback(
+        self,
+        callback: Callable[[str], Awaitable[None]] | None,
+    ) -> None:
+        self._completion_callback = callback
+
+    async def emit_runtime_completion(self, data_flow_id: str) -> None:
+        callback = self._completion_callback
+        assert callback is not None
+        await callback(data_flow_id)
 
 
 def test_start_can_resume_push_without_repeating_data_address() -> None:
@@ -260,6 +280,28 @@ def test_start_rejects_resume_when_runtime_error_already_terminated_flow() -> No
 
     with pytest.raises(DataFlowConflictError):
         asyncio.run(service.start(start_message("proc-runtime-error-restart")))
+
+
+def test_runtime_completion_callback_marks_started_flow_completed() -> None:
+    transfer_executor = CompletionAwareTransferExecutor()
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=transfer_executor,
+        control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+    )
+
+    started_result = asyncio.run(service.start(start_message("proc-runtime-complete")))
+    assert started_result.status_code == 200
+    assert started_result.body is not None
+    flow_id = started_result.body.data_flow_id
+    assert started_result.body.state is DataFlowState.STARTED
+
+    asyncio.run(transfer_executor.emit_runtime_completion(flow_id))
+
+    status = asyncio.run(service.get_status(flow_id))
+    assert status.state is DataFlowState.COMPLETED
 
 
 def test_terminate_rejects_transition_from_completed_terminal_state() -> None:

@@ -212,6 +212,36 @@ def test_push_start_uses_multipart_copy_async() -> None:
     assert fake_client.complete_calls == 1
 
 
+def test_push_start_emits_completion_callback_after_successful_copy() -> None:
+    fake_client = FakeS3Client({("src-bucket", "source.bin"): 2 * 1024 * 1024})
+    completions: list[str] = []
+    completion_event = asyncio.Event()
+
+    async def completion_callback(data_flow_id: str) -> None:
+        completions.append(data_flow_id)
+        completion_event.set()
+
+    executor = S3TransferExecutor(
+        multipart_threshold_mb=5,
+        multipart_part_size_mb=5,
+        s3_client_factory=lambda *_: fake_client,
+        completion_callback=completion_callback,
+    )
+
+    data_flow = _build_data_flow("callback")
+    message = _build_start_message("callback")
+
+    async def scenario() -> None:
+        await executor.start(data_flow, message)
+        await asyncio.wait_for(completion_event.wait(), timeout=2.0)
+        await executor.complete(data_flow)
+
+    asyncio.run(scenario())
+
+    assert completions == [data_flow.data_flow_id]
+    assert fake_client.put_calls == 1
+
+
 def test_suspend_then_resume_continues_multipart_transfer() -> None:
     fake_client = FakeS3Client(
         {("src-bucket", "source.bin"): 16 * 1024 * 1024},

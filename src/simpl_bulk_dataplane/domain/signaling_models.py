@@ -54,7 +54,7 @@ class DataFlowBaseMessage(SignalingModel):
     process_id: str = Field(alias="processId")
     agreement_id: str = Field(alias="agreementId")
     dataset_id: str = Field(alias="datasetId")
-    callback_address: str | None = Field(default=None, alias="callbackAddress")
+    callback_address: str = Field(alias="callbackAddress")
     transfer_type: str = Field(alias="transferType")
     metadata: dict[str, Any] = Field(default_factory=dict)
     labels: list[str] = Field(default_factory=list)

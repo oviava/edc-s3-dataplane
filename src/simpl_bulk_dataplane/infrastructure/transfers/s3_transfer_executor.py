@@ -168,6 +168,7 @@ class S3TransferExecutor(TransferExecutor):
         ]
         | None = None,
         progress_callback: Callable[[str, TransferProgressSnapshot], Awaitable[None]] | None = None,
+        completion_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._default_region = default_region
         threshold_mb = max(_MIN_MULTIPART_SIZE_MB, multipart_threshold_mb)
@@ -180,6 +181,15 @@ class S3TransferExecutor(TransferExecutor):
         self._sessions_lock = asyncio.Lock()
         self._s3_client_factory = s3_client_factory or self._build_default_s3_client
         self._progress_callback = progress_callback
+        self._completion_callback = completion_callback
+
+    def set_completion_callback(
+        self,
+        callback: Callable[[str], Awaitable[None]] | None,
+    ) -> None:
+        """Register callback invoked after successful runtime completion."""
+
+        self._completion_callback = callback
 
     async def prepare(
         self, data_flow: DataFlow, message: DataFlowPrepareMessage
@@ -332,6 +342,7 @@ class S3TransferExecutor(TransferExecutor):
     async def _run_transfer(self, session: TransferSession) -> None:
         """Run one copy workflow in background."""
 
+        completed_successfully = False
         async with session.lock:
             try:
                 await self._execute_plan(session)
@@ -339,6 +350,7 @@ class S3TransferExecutor(TransferExecutor):
                 if session.object_size_bytes is not None:
                     session.bytes_transferred = session.object_size_bytes
                 session.last_error = None
+                completed_successfully = True
             except asyncio.CancelledError:
                 session.last_error = "Transfer task cancelled"
                 await self._emit_progress(
@@ -353,6 +365,8 @@ class S3TransferExecutor(TransferExecutor):
                     session.data_flow_id,
                     self._snapshot_from_session(session),
                 )
+                if completed_successfully:
+                    self._schedule_completion_callback(session.data_flow_id)
 
     async def _execute_plan(self, session: TransferSession) -> None:
         """Run copy workflow for one object or all objects in a source bucket."""
@@ -380,7 +394,9 @@ class S3TransferExecutor(TransferExecutor):
         session.completed_bytes = sum(
             size_by_source_key.get(source_key, 0) for source_key in session.completed_source_keys
         )
-        session.bytes_transferred = session.completed_bytes + sum(session.uploaded_part_sizes.values())
+        session.bytes_transferred = session.completed_bytes + sum(
+            session.uploaded_part_sizes.values()
+        )
         await self._emit_progress(session.data_flow_id, self._snapshot_from_session(session))
 
         for item in work_items:
@@ -579,7 +595,9 @@ class S3TransferExecutor(TransferExecutor):
             Body=payload,
         )
         session.uploaded_part_sizes[part_number] = len(payload)
-        session.bytes_transferred = session.completed_bytes + sum(session.uploaded_part_sizes.values())
+        session.bytes_transferred = session.completed_bytes + sum(
+            session.uploaded_part_sizes.values()
+        )
         await self._emit_progress(session.data_flow_id, self._snapshot_from_session(session))
         return part_number, self._extract_etag(response)
 
@@ -592,7 +610,10 @@ class S3TransferExecutor(TransferExecutor):
 
         source_key = plan.source.key
         if source_key is not None:
-            size = await self._get_source_size(source_client, self._with_key(plan.source, source_key))
+            size = await self._get_source_size(
+                source_client,
+                self._with_key(plan.source, source_key),
+            )
             destination_key = self._resolve_destination_key(
                 source_key=source_key,
                 destination_key=plan.destination.key,
@@ -853,6 +874,25 @@ class S3TransferExecutor(TransferExecutor):
             return
         with suppress(Exception):
             await self._progress_callback(data_flow_id, snapshot)
+
+    def _schedule_completion_callback(self, data_flow_id: str) -> None:
+        """Dispatch completion callback asynchronously in best-effort mode."""
+
+        if self._completion_callback is None:
+            return
+        asyncio.create_task(
+            self._notify_completion(data_flow_id),
+            name=f"s3-transfer-complete-{data_flow_id}",
+        )
+
+    async def _notify_completion(self, data_flow_id: str) -> None:
+        """Notify callback that transfer completed successfully."""
+
+        callback = self._completion_callback
+        if callback is None:
+            return
+        with suppress(Exception):
+            await callback(data_flow_id)
 
     def _build_plan(
         self,

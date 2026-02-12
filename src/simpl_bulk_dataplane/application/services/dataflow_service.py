@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -52,6 +54,17 @@ class CommandResult:
     location: str | None = None
 
 
+@runtime_checkable
+class _CompletionCallbackAwareTransferExecutor(Protocol):
+    """Optional transfer-executor extension for runtime completion callbacks."""
+
+    def set_completion_callback(
+        self,
+        callback: Callable[[str], Awaitable[None]] | None,
+    ) -> None:
+        """Register callback invoked after runtime transfer completion."""
+
+
 class DataFlowService:
     """Orchestrates state transitions for signaling commands."""
 
@@ -68,6 +81,8 @@ class DataFlowService:
         self._transfer_executor = transfer_executor
         self._control_plane_notifier = control_plane_notifier
         self._dataflow_event_publisher = dataflow_event_publisher
+        if isinstance(transfer_executor, _CompletionCallbackAwareTransferExecutor):
+            transfer_executor.set_completion_callback(self._completed_from_runtime)
 
     async def prepare(self, message: DataFlowPrepareMessage) -> CommandResult:
         """Handle `/dataflows/prepare`."""
@@ -497,6 +512,12 @@ class DataFlowService:
         await self._control_plane_notifier.notify_terminated(data_flow, response)
         await self._publish_state_event(data_flow)
         return data_flow
+
+    async def _completed_from_runtime(self, data_flow_id: str) -> None:
+        """Best-effort completion hook fired by transfer runtime."""
+
+        with suppress(DataFlowConflictError, DataFlowNotFoundError, DataFlowValidationError):
+            await self.completed(data_flow_id)
 
 
 __all__ = ["CommandResult", "DataFlowService"]
