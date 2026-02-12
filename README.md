@@ -57,6 +57,9 @@ Run full manual stack (manual UI + 2 dataplanes + 2 Postgres + RabbitMQ MQTT bro
 docker compose -f docker-compose.manual.yml up -d --build
 ```
 
+Detailed manual playground walkthrough (UI examples, MinIO bucket/file setup, pause/resume):
+- `README.manual.md`
+
 If you changed startup settings, recreate services:
 
 ```bash
