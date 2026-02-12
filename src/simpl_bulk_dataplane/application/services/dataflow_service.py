@@ -224,6 +224,11 @@ class DataFlowService:
         data_flow = await self._reconcile_runtime_failure(data_flow)
         if data_flow.state == DataFlowState.TERMINATED:
             return
+        if data_flow.state in TERMINAL_STATES:
+            raise DataFlowConflictError(
+                f"Cannot terminate data flow '{data_flow.data_flow_id}' in "
+                f"terminal state '{data_flow.state}'."
+            )
 
         await self._transfer_executor.terminate(data_flow, reason)
         data_flow.state = DataFlowState.TERMINATED
@@ -239,6 +244,11 @@ class DataFlowService:
         data_flow = await self._reconcile_runtime_failure(data_flow)
         if data_flow.state == DataFlowState.COMPLETED:
             return
+        if data_flow.state in TERMINAL_STATES:
+            raise DataFlowConflictError(
+                f"Cannot complete data flow '{data_flow.data_flow_id}' in "
+                f"terminal state '{data_flow.state}'."
+            )
 
         await self._transfer_executor.complete(data_flow)
         data_flow.state = DataFlowState.COMPLETED

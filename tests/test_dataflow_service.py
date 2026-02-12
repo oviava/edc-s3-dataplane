@@ -260,3 +260,45 @@ def test_start_rejects_resume_when_runtime_error_already_terminated_flow() -> No
 
     with pytest.raises(DataFlowConflictError):
         asyncio.run(service.start(start_message("proc-runtime-error-restart")))
+
+
+def test_terminate_rejects_transition_from_completed_terminal_state() -> None:
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=RecordingTransferExecutor(),
+        control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+    )
+
+    started_result = asyncio.run(service.start(start_message("proc-terminal-completed")))
+    assert started_result.body is not None
+    flow_id = started_result.body.data_flow_id
+    asyncio.run(service.completed(flow_id))
+
+    with pytest.raises(DataFlowConflictError):
+        asyncio.run(service.terminate(flow_id, "late-terminate"))
+
+    status = asyncio.run(service.get_status(flow_id))
+    assert status.state is DataFlowState.COMPLETED
+
+
+def test_completed_rejects_transition_from_terminated_terminal_state() -> None:
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=RecordingTransferExecutor(),
+        control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+    )
+
+    started_result = asyncio.run(service.start(start_message("proc-terminal-terminated")))
+    assert started_result.body is not None
+    flow_id = started_result.body.data_flow_id
+    asyncio.run(service.terminate(flow_id, "manual-stop"))
+
+    with pytest.raises(DataFlowConflictError):
+        asyncio.run(service.completed(flow_id))
+
+    status = asyncio.run(service.get_status(flow_id))
+    assert status.state is DataFlowState.TERMINATED
