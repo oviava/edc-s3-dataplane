@@ -24,6 +24,7 @@ from simpl_bulk_dataplane.domain.signaling_models import (
     DataAddress,
     DataFlowPrepareMessage,
     DataFlowResponseMessage,
+    DataFlowResumeMessage,
     DataFlowStartedNotificationMessage,
     DataFlowStartMessage,
     DataFlowStatusResponseMessage,
@@ -31,6 +32,7 @@ from simpl_bulk_dataplane.domain.signaling_models import (
     DataFlowTerminateMessage,
     DataPlaneRegistrationMessage,
     EndpointProperty,
+    TransferStartResponseMessage,
 )
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState, TransferMode
 
@@ -47,6 +49,7 @@ __all__ = [
     "DataFlowNotFoundError",
     "DataPlaneRegistrationMessage",
     "DataFlowPrepareMessage",
+    "DataFlowResumeMessage",
     "DataFlowRepository",
     "DataFlowResponseMessage",
     "DataFlowStartMessage",
@@ -57,6 +60,7 @@ __all__ = [
     "DataFlowTerminateMessage",
     "DataFlowValidationError",
     "EndpointProperty",
+    "TransferStartResponseMessage",
     "TransferExecutor",
     "TransferProgressSnapshot",
     "TransferMode",

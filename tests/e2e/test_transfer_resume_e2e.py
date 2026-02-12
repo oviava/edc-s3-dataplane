@@ -268,14 +268,15 @@ def test_transfer_100mb_with_suspend_resume_across_two_dataplanes(docker_stack: 
     assert not _object_exists(destination_client, DEST_BUCKET, DEST_KEY)
 
     resumed_response = _post_json(
-        f"{DATAPLANE_A_URL}/dataflows/start",
-        _start_payload(
-            process_id=process_id,
-            source_data_address=source_address_a,
-            destination_data_address=None,
-        ),
+        f"{DATAPLANE_A_URL}/dataflows/{data_flow_id_a}/resume",
+        {
+            "messageId": f"resume-{uuid4()}",
+            "processId": process_id,
+        },
     )
-    assert str(resumed_response["dataFlowId"]) == data_flow_id_a
+    data_address = resumed_response.get("dataAddress")
+    assert isinstance(data_address, dict)
+    assert data_address.get("endpoint") == f"s3://{DEST_BUCKET}/{DEST_KEY}"
     _wait_for_object(
         destination_client,
         DEST_BUCKET,

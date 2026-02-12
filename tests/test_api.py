@@ -86,3 +86,60 @@ def test_start_without_callback_address_returns_422() -> None:
         response = client.post("/dataflows/start", json=payload)
 
     assert response.status_code == 422
+
+
+def test_resume_endpoint_resumes_suspended_flow() -> None:
+    get_dataflow_service.cache_clear()
+    get_settings.cache_clear()
+
+    process_id = f"proc-{uuid4()}"
+    payload = _base_payload(process_id, "com.test.s3-PULL")
+
+    with TestClient(app) as client:
+        start_response = client.post("/dataflows/start", json=payload)
+        assert start_response.status_code == 200
+        flow_id = start_response.json()["dataFlowId"]
+
+        suspend_response = client.post(
+            f"/dataflows/{flow_id}/suspend",
+            json={"reason": "pause-for-resume"},
+        )
+        assert suspend_response.status_code == 200
+
+        resume_response = client.post(
+            f"/dataflows/{flow_id}/resume",
+            json={
+                "messageId": f"resume-{uuid4()}",
+                "processId": process_id,
+            },
+        )
+
+    assert resume_response.status_code == 200
+    body = resume_response.json()
+    assert "dataAddress" in body
+    assert body["dataAddress"]["endpoint"] == "s3://bucket-b/object.csv"
+
+
+def test_resume_endpoint_requires_matching_process_id() -> None:
+    get_dataflow_service.cache_clear()
+    get_settings.cache_clear()
+
+    process_id = f"proc-{uuid4()}"
+    payload = _base_payload(process_id, "com.test.s3-PULL")
+
+    with TestClient(app) as client:
+        start_response = client.post("/dataflows/start", json=payload)
+        assert start_response.status_code == 200
+        flow_id = start_response.json()["dataFlowId"]
+        assert client.post(f"/dataflows/{flow_id}/suspend").status_code == 200
+
+        resume_response = client.post(
+            f"/dataflows/{flow_id}/resume",
+            json={
+                "messageId": f"resume-{uuid4()}",
+                "processId": f"different-{uuid4()}",
+            },
+        )
+
+    assert resume_response.status_code == 400
+    assert "processId" in resume_response.json()["detail"]

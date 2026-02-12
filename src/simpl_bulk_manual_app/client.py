@@ -64,6 +64,20 @@ class DataPlaneClient:
         )
         self._ensure_success(response)
 
+    async def resume_dataflow(
+        self,
+        dataplane_url: str,
+        data_flow_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call `/dataflows/{id}/resume`."""
+
+        response = await self._http.post(
+            self._endpoint(dataplane_url, f"/dataflows/{data_flow_id}/resume"),
+            json=payload,
+        )
+        return self._parse_json_response(response)
+
     def _endpoint(self, base_url: str, path: str) -> str:
         clean_base = base_url.strip().rstrip("/")
         if not clean_base:

@@ -10,6 +10,7 @@ from simpl_bulk_manual_app.main import create_app
 class FakeDataPlaneClient:
     def __init__(self, *_: object, **__: object) -> None:
         self.start_calls: list[tuple[str, dict[str, Any]]] = []
+        self.resume_calls: list[tuple[str, str, dict[str, Any]]] = []
         self.started_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.suspend_calls: list[tuple[str, str, str | None]] = []
         self.list_calls: list[str] = []
@@ -49,6 +50,22 @@ class FakeDataPlaneClient:
         reason: str | None = None,
     ) -> None:
         self.suspend_calls.append((dataplane_url, data_flow_id, reason))
+
+    async def resume_dataflow(
+        self,
+        dataplane_url: str,
+        data_flow_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.resume_calls.append((dataplane_url, data_flow_id, payload))
+        return {
+            "dataAddress": {
+                "@type": "DataAddress",
+                "endpointType": "urn:aws:s3",
+                "endpoint": "s3://bucket/key",
+                "endpointProperties": [],
+            }
+        }
 
 
 class FakeMqttDataFlowEventStore:
@@ -90,7 +107,7 @@ class FakeMqttDataFlowEventStore:
         return self._revision, self._flows
 
 
-def test_manual_ui_start_push_and_start_existing_replays_start(monkeypatch: Any) -> None:
+def test_manual_ui_start_push_and_resume_existing_uses_resume(monkeypatch: Any) -> None:
     monkeypatch.setattr("simpl_bulk_manual_app.main.DataPlaneClient", FakeDataPlaneClient)
     app = create_app()
 
@@ -117,7 +134,11 @@ def test_manual_ui_start_push_and_start_existing_replays_start(monkeypatch: Any)
         assert start_again_response.status_code == 200
 
         fake_client = client.app.state.dataplane_client
-        assert len(fake_client.start_calls) == 2
+        assert len(fake_client.start_calls) == 1
+        assert len(fake_client.resume_calls) == 1
+        _, resumed_flow_id, resume_payload = fake_client.resume_calls[0]
+        assert resumed_flow_id == "flow-1"
+        assert "processId" in resume_payload
 
 
 def test_manual_ui_start_push_passes_credentials_via_data_address(monkeypatch: Any) -> None:

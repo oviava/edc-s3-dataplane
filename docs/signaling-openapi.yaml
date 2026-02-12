@@ -121,7 +121,8 @@ paths:
         machine transition to STARTING or STARTED. If the state machine transitions to STARTING, the [=Data Plane=] MUST
         return HTTP 202 Accepted with the `Location` header set to the [data flow status relative URL](#status) and a
         message body containing a `DataFlowResponseMessage`. If the state machine transitions to STARTED, the Data
-        Plane MUST return HTTP 200 OK and a `DataFlowResponseMessage`.
+        Plane MUST return HTTP 200 OK and a `DataFlowResponseMessage`. Repeated DSP transfer starts for existing flows
+        (for example, after suspend) MUST be handled by `/dataflows/{id}/resume`.
       operationId: startDataFlow
       requestBody:
         description: DataFlow start request
@@ -200,6 +201,54 @@ paths:
       responses:
         '200':
           description: DataFlow suspended successfully
+        '400':
+          description: Bad Request - invalid input, invalid object state or missing required parameters
+        '404':
+          description: Not Found - data flow with specified ID does not exist
+
+  /dataflows/{id}/resume:
+    post:
+      tags:
+        - Data plane endpoints
+      summary: Resume a suspended DataFlow
+      description: |
+        The resume request signals to the data plane to synchronously resume a suspended data transfer.
+        Both the request and response may carry a dataAddress so updated endpoint information can be propagated
+        during suspend/start cycles.
+      operationId: resumeDataFlowById
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DataFlowResumeMessage'
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The unique identifier of the data flow to resume
+          schema:
+            type: string
+            example: flow-1234
+      responses:
+        '200':
+          description: DataFlow resumed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferStartResponseMessage'
+              example:
+                dataAddress:
+                  '@type': DataAddress
+                  endpointType: https://23id.org.idsa/v4.1/HTTP
+                  endpoint: https://example.com/api/data
+                  endpointProperties:
+                    - '@type': EndpointProperty
+                      name: authorization
+                      value: 5up3r53cur3t0k3n
+                    - '@type': EndpointProperty
+                      name: authType
+                      value: bearer
         '400':
           description: Bad Request - invalid input, invalid object state or missing required parameters
         '404':
@@ -635,6 +684,30 @@ components:
 
     DataFlowStartedNotificationMessage:
       type: object
+      properties:
+        dataAddress:
+          $ref: '#/components/schemas/DataAddress'
+
+    DataFlowResumeMessage:
+      type: object
+      required: [ messageId, processId ]
+      properties:
+        messageId:
+          type: string
+          description: Unique identifier for the resume message
+          example: b1d5f9e2-3c4b-4f7a-9c3e-2f1e5d6c7b8a
+        processId:
+          type: string
+          description: The transfer process ID as assigned by the control plane for correlation
+          example: test-transfer-process-id
+        dataAddress:
+          $ref: '#/components/schemas/DataAddress'
+
+    TransferStartResponseMessage:
+      type: object
+      description: |
+        Response body used to propagate endpoint updates during transfer start/resume handling.
+        The containing object allows adding fields in future versions.
       properties:
         dataAddress:
           $ref: '#/components/schemas/DataAddress'

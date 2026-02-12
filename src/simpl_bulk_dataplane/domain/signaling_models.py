@@ -82,6 +82,14 @@ class DataFlowSuspendMessage(SignalingModel):
     reason: str | None = None
 
 
+class DataFlowResumeMessage(SignalingModel):
+    """Resume request."""
+
+    message_id: str = Field(alias="messageId")
+    process_id: str = Field(alias="processId")
+    data_address: DataAddress | None = Field(default=None, alias="dataAddress")
+
+
 class DataFlowTerminateMessage(SignalingModel):
     """Terminate request."""
 
@@ -105,6 +113,12 @@ class DataFlowStatusResponseMessage(SignalingModel):
     state: DataFlowState
 
 
+class TransferStartResponseMessage(SignalingModel):
+    """Resume/start response body containing optional endpoint updates."""
+
+    data_address: DataAddress | None = Field(default=None, alias="dataAddress")
+
+
 class DataPlaneRegistrationMessage(SignalingModel):
     """Data plane registration payload sent to control plane."""
 
@@ -122,6 +136,7 @@ __all__ = [
     "DataPlaneRegistrationMessage",
     "DataFlowBaseMessage",
     "DataFlowPrepareMessage",
+    "DataFlowResumeMessage",
     "DataFlowResponseMessage",
     "DataFlowStartMessage",
     "DataFlowStartedNotificationMessage",
@@ -129,4 +144,5 @@ __all__ = [
     "DataFlowSuspendMessage",
     "DataFlowTerminateMessage",
     "EndpointProperty",
+    "TransferStartResponseMessage",
 ]

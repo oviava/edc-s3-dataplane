@@ -32,9 +32,11 @@ from simpl_bulk_dataplane.domain.signaling_models import (
     DataFlowBaseMessage,
     DataFlowPrepareMessage,
     DataFlowResponseMessage,
+    DataFlowResumeMessage,
     DataFlowStartedNotificationMessage,
     DataFlowStartMessage,
     DataFlowStatusResponseMessage,
+    TransferStartResponseMessage,
 )
 from simpl_bulk_dataplane.domain.transfer_types import (
     TERMINAL_STATES,
@@ -43,6 +45,11 @@ from simpl_bulk_dataplane.domain.transfer_types import (
     ensure_s3_transfer_type,
     parse_transfer_mode,
 )
+
+_FLOW_ORIGIN_METADATA_KEY = "_dpsFlowOrigin"
+_FLOW_ORIGIN_PREPARE = "prepare"
+_FLOW_ORIGIN_START = "start"
+_STARTED_NOTIFICATION_SEEN_METADATA_KEY = "_dpsStartedNotificationSeen"
 
 
 @dataclass(slots=True)
@@ -95,7 +102,11 @@ class DataFlowService:
             )
 
         transfer_mode = parse_transfer_mode(message.transfer_type)
-        data_flow = self._new_data_flow(message, transfer_mode)
+        data_flow = self._new_data_flow(
+            message,
+            transfer_mode,
+            flow_origin=_FLOW_ORIGIN_PREPARE,
+        )
 
         if self._is_async_requested(message.metadata, "Prepare"):
             data_flow.state = DataFlowState.PREPARING
@@ -126,36 +137,20 @@ class DataFlowService:
 
         existing = await self._repository.get_by_process_id(message.process_id)
         if existing is not None:
-            existing = await self._reconcile_runtime_failure(existing)
-        if existing is None:
-            data_flow = self._new_data_flow(message, transfer_mode)
-        elif existing.state in TERMINAL_STATES:
             raise DataFlowConflictError(
-                f"Cannot start data flow '{existing.data_flow_id}' in state '{existing.state}'."
-            )
-        else:
-            data_flow = existing
-
-        if existing is not None and existing.transfer_mode is not transfer_mode:
-            raise DataFlowConflictError(
-                "Incoming transferType is incompatible with existing flow mode "
-                f"for processId '{message.process_id}'."
+                f"A data flow already exists for processId '{message.process_id}'. "
+                "Use /dataflows/{id}/resume for suspend/start cycles."
             )
 
-        effective_data_address = message.data_address
-        if (
-            transfer_mode is TransferMode.PUSH
-            and effective_data_address is None
-            and existing is not None
-            and existing.data_address is not None
-        ):
-            # Resume on start can reuse the established push destination.
-            effective_data_address = existing.data_address
+        data_flow = self._new_data_flow(
+            message,
+            transfer_mode,
+            flow_origin=_FLOW_ORIGIN_START,
+        )
+        self._validate_start_data_address(transfer_mode, message.data_address)
 
-        self._validate_start_data_address(transfer_mode, effective_data_address)
-
-        if effective_data_address is not None:
-            data_flow.data_address = effective_data_address
+        if message.data_address is not None:
+            data_flow.data_address = message.data_address
 
         if self._is_async_requested(message.metadata, "Start"):
             data_flow.state = DataFlowState.STARTING
@@ -167,11 +162,7 @@ class DataFlowService:
                 location=data_flow.status_path,
             )
 
-        executor_message = message
-        if effective_data_address is not message.data_address:
-            executor_message = message.model_copy(update={"data_address": effective_data_address})
-
-        started_address = await self._transfer_executor.start(data_flow, executor_message)
+        started_address = await self._transfer_executor.start(data_flow, message)
         if started_address is not None:
             data_flow.data_address = started_address
 
@@ -214,8 +205,51 @@ class DataFlowService:
 
         await self._transfer_executor.notify_started(data_flow, effective_message)
         data_flow.state = DataFlowState.STARTED
+        data_flow.metadata[_STARTED_NOTIFICATION_SEEN_METADATA_KEY] = True
         await self._repository.upsert(data_flow)
         await self._publish_state_event(data_flow)
+
+    async def resume(
+        self,
+        data_flow_id: str,
+        message: DataFlowResumeMessage,
+    ) -> TransferStartResponseMessage:
+        """Handle `/dataflows/{id}/resume`."""
+
+        data_flow = await self._get_data_flow_or_raise(data_flow_id)
+        data_flow = await self._reconcile_runtime_failure(data_flow)
+        if data_flow.state != DataFlowState.SUSPENDED:
+            raise DataFlowValidationError(
+                f"Resume is only allowed in SUSPENDED state, got '{data_flow.state}'."
+            )
+        if message.process_id != data_flow.process_id:
+            raise DataFlowValidationError(
+                "processId in resume message does not match the targeted data flow."
+            )
+
+        if message.data_address is not None:
+            data_flow.data_address = message.data_address
+
+        if self._should_resume_via_started_notification(data_flow):
+            started_message = self._resume_started_notification_message(data_flow)
+            await self._transfer_executor.notify_started(data_flow, started_message)
+            data_flow.metadata[_STARTED_NOTIFICATION_SEEN_METADATA_KEY] = True
+        else:
+            if data_flow.transfer_mode is TransferMode.PUSH and data_flow.data_address is None:
+                raise DataFlowValidationError(
+                    "dataAddress is required to resume provider-push data flows."
+                )
+            started_address = await self._transfer_executor.start(
+                data_flow,
+                self._resume_start_message(data_flow),
+            )
+            if started_address is not None:
+                data_flow.data_address = started_address
+
+        data_flow.state = DataFlowState.STARTED
+        await self._repository.upsert(data_flow)
+        await self._publish_state_event(data_flow)
+        return TransferStartResponseMessage(data_address=data_flow.data_address)
 
     async def suspend(self, data_flow_id: str, reason: str | None) -> None:
         """Handle `/dataflows/{id}/suspend`."""
@@ -306,8 +340,17 @@ class DataFlowService:
         data_flow = await self._reconcile_runtime_failure(data_flow)
         return await self._to_data_flow_info(data_flow)
 
-    def _new_data_flow(self, message: DataFlowBaseMessage, transfer_mode: TransferMode) -> DataFlow:
+    def _new_data_flow(
+        self,
+        message: DataFlowBaseMessage,
+        transfer_mode: TransferMode,
+        *,
+        flow_origin: str,
+    ) -> DataFlow:
         """Build a new data flow aggregate from incoming request data."""
+
+        metadata = dict(message.metadata)
+        metadata[_FLOW_ORIGIN_METADATA_KEY] = flow_origin
 
         return DataFlow(
             data_flow_id=f"flow-{uuid4()}",
@@ -321,7 +364,7 @@ class DataFlowService:
             dataset_id=message.dataset_id,
             callback_address=message.callback_address,
             labels=list(message.labels),
-            metadata=dict(message.metadata),
+            metadata=metadata,
         )
 
     def _response_message(
@@ -384,6 +427,61 @@ class DataFlowService:
                 "dataAddress must be omitted on /dataflows/{id}/started "
                 "for provider-push transfers."
             )
+
+    def _flow_origin(self, data_flow: DataFlow) -> str:
+        """Return the flow origin marker from metadata, defaulting to start."""
+
+        origin = data_flow.metadata.get(_FLOW_ORIGIN_METADATA_KEY)
+        if isinstance(origin, str) and origin in {_FLOW_ORIGIN_PREPARE, _FLOW_ORIGIN_START}:
+            return origin
+        return _FLOW_ORIGIN_START
+
+    def _should_resume_via_started_notification(self, data_flow: DataFlow) -> bool:
+        """Decide whether resume should reuse the `/started` execution path."""
+
+        flow_origin = self._flow_origin(data_flow)
+        if data_flow.transfer_mode is TransferMode.PUSH:
+            return flow_origin == _FLOW_ORIGIN_PREPARE
+
+        started_seen = data_flow.metadata.get(_STARTED_NOTIFICATION_SEEN_METADATA_KEY) is True
+        return flow_origin == _FLOW_ORIGIN_PREPARE or started_seen
+
+    def _resume_started_notification_message(
+        self,
+        data_flow: DataFlow,
+    ) -> DataFlowStartedNotificationMessage | None:
+        """Build the executor message used when resume follows `/started` semantics."""
+
+        if data_flow.transfer_mode is TransferMode.PUSH:
+            return None
+        if data_flow.data_address is None:
+            raise DataFlowValidationError(
+                "dataAddress is required to resume consumer-pull data flows."
+            )
+        return DataFlowStartedNotificationMessage(data_address=data_flow.data_address)
+
+    def _resume_start_message(self, data_flow: DataFlow) -> DataFlowStartMessage:
+        """Build a synthetic start message for provider-side resume handling."""
+
+        callback_address = data_flow.callback_address
+        if callback_address is None:
+            raise DataFlowValidationError(
+                "Cannot resume flow without callbackAddress persisted on the data flow."
+            )
+        return DataFlowStartMessage(
+            message_id=f"resume-{uuid4()}",
+            participant_id=data_flow.participant_id,
+            counter_party_id=data_flow.counter_party_id,
+            dataspace_context=data_flow.dataspace_context,
+            process_id=data_flow.process_id,
+            agreement_id=data_flow.agreement_id,
+            dataset_id=data_flow.dataset_id,
+            callback_address=callback_address,
+            transfer_type=data_flow.transfer_type,
+            labels=list(data_flow.labels),
+            metadata=dict(data_flow.metadata),
+            data_address=data_flow.data_address,
+        )
 
     async def _to_data_flow_info(self, data_flow: DataFlow) -> DataFlowInfoResponse:
         """Build management response payload for one data flow."""

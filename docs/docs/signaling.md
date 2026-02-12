@@ -220,6 +220,15 @@ DSP messages are shown with a dotted line.
 Note that the consumer `prepare` request (highlighted in gray) is optional for the pull transfer type, and MAY be
 omitted as an optimization by the consumer control plane.
 
+### Suspend and Resume Messaging
+
+DSP supports resumption by issuing `TransferStartMessage` again for an existing transfer process. This allows endpoint
+details in `DataAddress` to change over time (for example, when a suspended transfer is resumed with a rotated token).
+
+To preserve local state machine consistency and avoid races between both data planes when a transfer is resumed, this
+specification defines an explicit synchronous `resume` API for existing data flows. Implementations MUST propagate
+updated endpoint information through `dataAddress` during resume operations.
+
 ## Data Flow API
 
 The [=Data Flow=] API comprises separate [=Data Plane=] and [=Control Plane=] endpoints.
@@ -317,6 +326,10 @@ transition to STARTING or STARTED. If the state machine transitions to STARTING,
 Accepted with the `Location` header set to the [data flow status relative URL](#status) and a message body containing a
 `DataFlowResponseMessage`. If the state machine transitions to STARTED, the [=Data Plane=] MUST return HTTP 200 OK and a
 `DataFlowResponseMessage`.
+
+At the DSP layer, start may be sent multiple times for the same transfer process (for example, resume). Repeated starts
+for existing flows MUST be handled via [`/dataflows/:id/resume`](#resume), while `/dataflows/start` remains the operation
+that initializes a new data flow.
 
 |                 |                                                                                                                                                                                |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -443,6 +456,63 @@ The following is a non-normative example of a `DataFlowSuspendMessage`:
   "reason": "Suspending data flow due to scheduled maintenance."
 }
 ```
+
+#### Resume
+
+The `resume` request signals to the [=Data Plane=] to synchronously resume an existing suspended data transfer. The
+request MUST result in a state machine transition from SUSPENDED to STARTED and MUST return HTTP 200 when successful.
+The request and response may both carry an optional `DataAddress` so new endpoint information can be exchanged.
+
+|                 |                                                                         |
+| --------------- | ----------------------------------------------------------------------- |
+| **HTTP Method** | `POST`                                                                  |
+| **URL Path**    | `/dataflows/:id/resume`                                                 |
+| **Request**     | [`DataFlowResumeMessage`](#dataflowresumemessage)                       |
+| **Response**    | `HTTP 200` with [`TransferStartResponseMessage`](#transferstartresponsemessage) OR `HTTP 4xx Client Error` |
+
+##### DataFlowResumeMessage
+
+|              |                                                                                                                          |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| **Required** | - `messageId`: A unique identifier for the message.                                                                      |
+|              | - `processId`: The transfer process ID as assigned by the control plane for correlation.                                |
+| **Optional** | - `dataAddress`: A [DataAddress](#data-address) carrying updated endpoint information received during resume processing. |
+
+The following is a non-normative example of a `DataFlowResumeMessage`:
+
+```json
+{
+  "messageId": "b1d5f9e2-3c4b-4f7a-9c3e-2f1e5d6c7b8a",
+  "processId": "test-transfer-process-id",
+  "dataAddress": {}
+}
+```
+
+##### TransferStartResponseMessage
+
+|              |                                                                                                                         |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| **Optional** | - `dataAddress`: A [DataAddress](#data-address) carrying updated endpoint information to be propagated in DSP start response messages. |
+
+The response uses a containing object for extensibility. The following is a non-normative example of a
+`TransferStartResponseMessage` body:
+
+```json
+{
+  "dataAddress": {}
+}
+```
+
+Resume handling for the suspend/start scenarios is as follows:
+
+1. Provider Push - Provider Suspend/Start: the provider-side resume response MUST include `dataAddress` when endpoint
+   details change; this value MUST be propagated to the counterparty in `TransferStartResponseMessage`.
+2. Provider Push - Consumer Suspend/Start: the consumer-side caller MAY provide an updated `dataAddress` in the resume
+   request; the response MAY also return an updated `dataAddress`.
+3. Consumer Pull - Provider Suspend/Start: the provider-side resume response MAY include an updated `dataAddress` that
+   the consumer uses to pull data.
+4. Consumer Pull - Consumer Suspend/Start: the caller MAY provide an updated `dataAddress` in the resume request, and
+   the response MAY return updated endpoint information.
 
 #### Terminate
 

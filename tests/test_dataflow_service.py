@@ -13,6 +13,8 @@ from simpl_bulk_dataplane.domain.ports import TransferExecutor
 from simpl_bulk_dataplane.domain.signaling_models import (
     DataAddress,
     DataFlowPrepareMessage,
+    DataFlowResumeMessage,
+    DataFlowStartedNotificationMessage,
     DataFlowStartMessage,
 )
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState
@@ -99,6 +101,7 @@ class RecordingTransferExecutor(TransferExecutor):
 
     def __init__(self) -> None:
         self.start_messages: list[DataFlowStartMessage] = []
+        self.started_notifications: list[DataFlowStartedNotificationMessage | None] = []
 
     async def prepare(self, *_: object, **__: object) -> DataAddress | None:
         return None
@@ -113,9 +116,10 @@ class RecordingTransferExecutor(TransferExecutor):
 
     async def notify_started(
         self,
-        *_: object,
-        **__: object,
+        _data_flow: DataFlow,
+        message: DataFlowStartedNotificationMessage | None,
     ) -> None:
+        self.started_notifications.append(message)
         return None
 
     async def suspend(self, *_: object, **__: object) -> None:
@@ -179,7 +183,7 @@ class CompletionAwareTransferExecutor(RecordingTransferExecutor):
         await callback(data_flow_id)
 
 
-def test_start_can_resume_push_without_repeating_data_address() -> None:
+def test_resume_can_restart_push_without_repeating_data_address() -> None:
     transfer_executor = RecordingTransferExecutor()
     service = DataFlowService(
         dataplane_id="dataplane-test",
@@ -214,26 +218,106 @@ def test_start_can_resume_push_without_repeating_data_address() -> None:
 
     asyncio.run(service.suspend(flow_id, "maintenance"))
 
-    resume = DataFlowStartMessage(
+    resume = DataFlowResumeMessage(
         message_id="msg-4",
+        process_id="proc-resume-push",
+    )
+
+    resumed_result = asyncio.run(service.resume(flow_id, resume))
+    assert resumed_result.data_address is not None
+    assert len(transfer_executor.start_messages) == 2
+    assert transfer_executor.start_messages[1].data_address is not None
+    assert transfer_executor.start_messages[1].data_address.endpoint == "s3://dst-bucket/result.csv"
+
+
+def test_resume_pull_after_started_notification_uses_notify_started() -> None:
+    transfer_executor = RecordingTransferExecutor()
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=transfer_executor,
+        control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+    )
+
+    started_result = asyncio.run(service.start(start_message("proc-resume-pull")))
+    assert started_result.body is not None
+    flow_id = started_result.body.data_flow_id
+    source_address = DataAddress(
+        type_="DataAddress",
+        endpoint_type="urn:aws:s3",
+        endpoint="s3://src-bucket/source.csv",
+        endpoint_properties=[],
+    )
+
+    asyncio.run(
+        service.notify_started(
+            flow_id,
+            DataFlowStartedNotificationMessage(data_address=source_address),
+        )
+    )
+    asyncio.run(service.suspend(flow_id, "maintenance"))
+
+    resumed_result = asyncio.run(
+        service.resume(
+            flow_id,
+            DataFlowResumeMessage(
+                message_id="msg-5",
+                process_id="proc-resume-pull",
+            ),
+        )
+    )
+
+    assert resumed_result.data_address is not None
+    assert len(transfer_executor.started_notifications) >= 2
+    resume_notification = transfer_executor.started_notifications[-1]
+    assert resume_notification is not None
+    assert resume_notification.data_address is not None
+
+
+def test_resume_requires_process_id_to_match_flow() -> None:
+    transfer_executor = RecordingTransferExecutor()
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=InMemoryDataFlowRepository(),
+        transfer_executor=transfer_executor,
+        control_plane_notifier=NoopControlPlaneNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+    )
+
+    initial = DataFlowStartMessage(
+        message_id="msg-3",
         participant_id="did:web:provider",
         counter_party_id="did:web:consumer",
         dataspace_context="context-1",
-        process_id="proc-resume-push",
+        process_id="proc-resume-process-check",
         agreement_id="agreement-1",
         dataset_id="dataset-1",
         callback_address="https://example.com/callback",
         transfer_type="com.test.s3-PUSH",
+        data_address=DataAddress(
+            type_="DataAddress",
+            endpoint_type="urn:aws:s3",
+            endpoint="s3://dst-bucket/result.csv",
+            endpoint_properties=[],
+        ),
         metadata={"sourceBucket": "src-bucket", "sourceKey": "in.csv"},
     )
+    first_result = asyncio.run(service.start(initial))
+    assert first_result.body is not None
+    flow_id = first_result.body.data_flow_id
+    asyncio.run(service.suspend(flow_id, "maintenance"))
 
-    resumed_result = asyncio.run(service.start(resume))
-    assert resumed_result.status_code == 200
-    assert resumed_result.body is not None
-    assert resumed_result.body.state is DataFlowState.STARTED
-    assert len(transfer_executor.start_messages) == 2
-    assert transfer_executor.start_messages[1].data_address is not None
-    assert transfer_executor.start_messages[1].data_address.endpoint == "s3://dst-bucket/result.csv"
+    with pytest.raises(DataFlowValidationError):
+        asyncio.run(
+            service.resume(
+                flow_id,
+                DataFlowResumeMessage(
+                    message_id="msg-6",
+                    process_id="different-process-id",
+                ),
+            )
+        )
 
 
 def test_runtime_failure_reconciles_started_flow_to_terminated() -> None:

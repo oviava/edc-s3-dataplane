@@ -41,8 +41,20 @@ class ReplayCommand:
     """Command payloads required for starting suspended operations."""
 
     transfer_mode: TransferMode
-    start_payload: dict[str, Any]
-    pull_started_payload: dict[str, Any] | None = None
+    process_id: str
+    latest_data_address: dict[str, Any] | None = None
+
+
+def _build_resume_payload(command: ReplayCommand) -> dict[str, Any]:
+    """Build resume payload for `/dataflows/{id}/resume`."""
+
+    payload: dict[str, Any] = {
+        "messageId": f"manual-resume-msg-{uuid4()}",
+        "processId": command.process_id,
+    }
+    if command.latest_data_address is not None:
+        payload["dataAddress"] = command.latest_data_address
+    return payload
 
 
 def _normalize_dataplane_url(raw_url: str) -> str:
@@ -310,10 +322,23 @@ def create_app() -> FastAPI:
                         detail=f"Start succeeded but /started failed: {exc}",
                     ) from exc
 
+        latest_data_address: dict[str, Any] | None = None
+        raw_response_data_address = response.get("dataAddress")
+        if isinstance(raw_response_data_address, dict):
+            latest_data_address = raw_response_data_address
+        elif started_payload is not None:
+            started_data_address = started_payload.get("dataAddress")
+            if isinstance(started_data_address, dict):
+                latest_data_address = started_data_address
+        if latest_data_address is None:
+            start_payload_data_address = start_payload.get("dataAddress")
+            if isinstance(start_payload_data_address, dict):
+                latest_data_address = start_payload_data_address
+
         request.app.state.replay_commands[(dataplane_url, raw_flow_id)] = ReplayCommand(
             transfer_mode=body.transfer_mode,
-            start_payload=start_payload,
-            pull_started_payload=started_payload,
+            process_id=process_id,
+            latest_data_address=latest_data_address,
         )
 
         state = response.get("state")
@@ -409,11 +434,14 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/api/transfers/{data_flow_id}/start", status_code=200)
-    async def start_existing_transfer(
+    @app.post("/api/transfers/{data_flow_id}/resume", status_code=200)
+    async def resume_existing_transfer(
         data_flow_id: str,
         body: StartExistingTransferRequest,
         request: Request,
     ) -> dict[str, str]:
+        """Resume a suspended transfer created via this manual UI."""
+
         client: DataPlaneClient = request.app.state.dataplane_client
         dataplane_url = _normalize_dataplane_url(body.dataplane_url)
         replay_commands: dict[tuple[str, str], ReplayCommand] = request.app.state.replay_commands
@@ -428,22 +456,17 @@ def create_app() -> FastAPI:
             )
 
         try:
-            if command.transfer_mode is TransferMode.PUSH:
-                await client.start_dataflow(dataplane_url, command.start_payload)
-            else:
-                started_payload = command.pull_started_payload
-                if started_payload is None:
-                    started_response = await client.start_dataflow(
-                        dataplane_url,
-                        command.start_payload,
-                    )
-                    raw_data_address = started_response.get("dataAddress")
-                    if isinstance(raw_data_address, dict):
-                        started_payload = {"dataAddress": raw_data_address}
-                        command.pull_started_payload = started_payload
-                await client.notify_started(dataplane_url, data_flow_id, started_payload)
+            resume_response = await client.resume_dataflow(
+                dataplane_url=dataplane_url,
+                data_flow_id=data_flow_id,
+                payload=_build_resume_payload(command),
+            )
         except DataPlaneClientError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        raw_data_address = resume_response.get("dataAddress")
+        if isinstance(raw_data_address, dict):
+            command.latest_data_address = raw_data_address
 
         return {"status": "ok"}
 

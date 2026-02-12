@@ -18,11 +18,13 @@ from simpl_bulk_dataplane.domain.errors import (
 from simpl_bulk_dataplane.domain.signaling_models import (
     DataFlowPrepareMessage,
     DataFlowResponseMessage,
+    DataFlowResumeMessage,
     DataFlowStartedNotificationMessage,
     DataFlowStartMessage,
     DataFlowStatusResponseMessage,
     DataFlowSuspendMessage,
     DataFlowTerminateMessage,
+    TransferStartResponseMessage,
 )
 
 router = APIRouter(tags=["data-plane endpoints"])
@@ -119,6 +121,24 @@ async def suspend_data_flow(
         _raise_http_exception(exc)
 
     return Response(status_code=200)
+
+
+@router.post(
+    "/dataflows/{id}/resume",
+    response_model=TransferStartResponseMessage,
+    status_code=200,
+)
+async def resume_data_flow(
+    id: str = Path(...),
+    message: DataFlowResumeMessage = Body(...),
+    service: DataFlowService = Depends(get_dataflow_service),
+) -> TransferStartResponseMessage:
+    """Resume a suspended data flow synchronously."""
+
+    try:
+        return await service.resume(id, message)
+    except Exception as exc:  # noqa: BLE001
+        _raise_http_exception(exc)
 
 
 @router.post("/dataflows/{id}/terminate", status_code=200)
