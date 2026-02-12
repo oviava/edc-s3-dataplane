@@ -1,6 +1,13 @@
+
+
 # simpl-bulk-dataplane
 
 FastAPI scaffold for a DPS-compatible data plane that targets S3 `PUSH` and `PULL` transfer types.
+
+Preface: "I" built this in a couple of hours using agentic AI. It was a learning experience in using agentic AI to build a software project.
+
+There are a few things that are not fully up to spec. WIP
+
 
 ## Project structure
 
