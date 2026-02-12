@@ -1,5 +1,10 @@
 """Domain public API."""
 
+from simpl_bulk_dataplane.domain.callbacks import (
+    ControlPlaneCallbackEvent,
+    ControlPlaneCallbackEventType,
+    PendingControlPlaneCallbackEvent,
+)
 from simpl_bulk_dataplane.domain.entities import DataFlow
 from simpl_bulk_dataplane.domain.errors import (
     DataFlowConflictError,
@@ -15,6 +20,7 @@ from simpl_bulk_dataplane.domain.monitoring_models import (
     TransferProgressSnapshot,
 )
 from simpl_bulk_dataplane.domain.ports import (
+    CallbackOutboxRepository,
     ControlPlaneNotifier,
     DataFlowEventPublisher,
     DataFlowRepository,
@@ -37,7 +43,10 @@ from simpl_bulk_dataplane.domain.signaling_models import (
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState, TransferMode
 
 __all__ = [
+    "CallbackOutboxRepository",
     "ControlPlaneNotifier",
+    "ControlPlaneCallbackEvent",
+    "ControlPlaneCallbackEventType",
     "DataFlowEventPublisher",
     "DataAddress",
     "DataFlow",
@@ -60,6 +69,7 @@ __all__ = [
     "DataFlowTerminateMessage",
     "DataFlowValidationError",
     "EndpointProperty",
+    "PendingControlPlaneCallbackEvent",
     "TransferStartResponseMessage",
     "TransferExecutor",
     "TransferProgressSnapshot",

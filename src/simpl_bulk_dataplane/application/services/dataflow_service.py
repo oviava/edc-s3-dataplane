@@ -9,6 +9,10 @@ from typing import Protocol, runtime_checkable
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from simpl_bulk_dataplane.domain.callbacks import (
+    ControlPlaneCallbackEvent,
+    ControlPlaneCallbackEventType,
+)
 from simpl_bulk_dataplane.domain.entities import DataFlow
 from simpl_bulk_dataplane.domain.errors import (
     DataFlowConflictError,
@@ -22,6 +26,7 @@ from simpl_bulk_dataplane.domain.monitoring_models import (
     TransferProgressSnapshot,
 )
 from simpl_bulk_dataplane.domain.ports import (
+    CallbackOutboxRepository,
     ControlPlaneNotifier,
     DataFlowEventPublisher,
     DataFlowRepository,
@@ -72,6 +77,20 @@ class _CompletionCallbackAwareTransferExecutor(Protocol):
         """Register callback invoked after runtime transfer completion."""
 
 
+@runtime_checkable
+class _CallbackOutboxDispatcher(Protocol):
+    """Optional callback outbox dispatcher lifecycle + wake-up hooks."""
+
+    async def start(self) -> None:
+        """Start background callback delivery loop."""
+
+    async def stop(self) -> None:
+        """Stop background callback delivery loop."""
+
+    async def notify_new_event(self) -> None:
+        """Signal dispatcher that a new callback event was enqueued."""
+
+
 class DataFlowService:
     """Orchestrates state transitions for signaling commands."""
 
@@ -82,14 +101,32 @@ class DataFlowService:
         transfer_executor: TransferExecutor,
         control_plane_notifier: ControlPlaneNotifier,
         dataflow_event_publisher: DataFlowEventPublisher,
+        callback_outbox_dispatcher: _CallbackOutboxDispatcher | None = None,
     ) -> None:
         self._dataplane_id = dataplane_id
         self._repository = repository
         self._transfer_executor = transfer_executor
         self._control_plane_notifier = control_plane_notifier
         self._dataflow_event_publisher = dataflow_event_publisher
+        self._callback_outbox_dispatcher = callback_outbox_dispatcher
         if isinstance(transfer_executor, _CompletionCallbackAwareTransferExecutor):
             transfer_executor.set_completion_callback(self._completed_from_runtime)
+
+    async def startup(self) -> None:
+        """Start optional background workers owned by this service."""
+
+        dispatcher = self._callback_outbox_dispatcher
+        if dispatcher is None:
+            return
+        await dispatcher.start()
+
+    async def shutdown(self) -> None:
+        """Stop optional background workers owned by this service."""
+
+        dispatcher = self._callback_outbox_dispatcher
+        if dispatcher is None:
+            return
+        await dispatcher.stop()
 
     async def prepare(self, message: DataFlowPrepareMessage) -> CommandResult:
         """Handle `/dataflows/prepare`."""
@@ -123,9 +160,12 @@ class DataFlowService:
             data_flow.data_address = prepared_address
 
         data_flow.state = DataFlowState.PREPARED
-        await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
-        await self._control_plane_notifier.notify_prepared(data_flow, response)
+        await self._persist_transition_with_callback(
+            data_flow,
+            response,
+            callback_event_type=ControlPlaneCallbackEventType.PREPARED,
+        )
         await self._publish_state_event(data_flow)
         return CommandResult(status_code=200, body=response)
 
@@ -167,9 +207,12 @@ class DataFlowService:
             data_flow.data_address = started_address
 
         data_flow.state = DataFlowState.STARTED
-        await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
-        await self._control_plane_notifier.notify_started(data_flow, response)
+        await self._persist_transition_with_callback(
+            data_flow,
+            response,
+            callback_event_type=ControlPlaneCallbackEventType.STARTED,
+        )
         await self._publish_state_event(data_flow)
         return CommandResult(status_code=200, body=response)
 
@@ -281,9 +324,12 @@ class DataFlowService:
 
         await self._transfer_executor.terminate(data_flow, reason)
         data_flow.state = DataFlowState.TERMINATED
-        await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
-        await self._control_plane_notifier.notify_terminated(data_flow, response)
+        await self._persist_transition_with_callback(
+            data_flow,
+            response,
+            callback_event_type=ControlPlaneCallbackEventType.ERRORED,
+        )
         await self._publish_state_event(data_flow)
 
     async def completed(self, data_flow_id: str) -> None:
@@ -301,9 +347,12 @@ class DataFlowService:
 
         await self._transfer_executor.complete(data_flow)
         data_flow.state = DataFlowState.COMPLETED
-        await self._repository.upsert(data_flow)
         response = self._response_message(data_flow)
-        await self._control_plane_notifier.notify_completed(data_flow, response)
+        await self._persist_transition_with_callback(
+            data_flow,
+            response,
+            callback_event_type=ControlPlaneCallbackEventType.COMPLETED,
+        )
         await self._publish_state_event(data_flow)
 
     async def get_status(self, data_flow_id: str) -> DataFlowStatusResponseMessage:
@@ -592,6 +641,59 @@ class DataFlowService:
         with suppress(Exception):
             await self._dataflow_event_publisher.publish_state(data_flow, progress)
 
+    async def _persist_transition_with_callback(
+        self,
+        data_flow: DataFlow,
+        response: DataFlowResponseMessage,
+        *,
+        callback_event_type: ControlPlaneCallbackEventType,
+    ) -> None:
+        """Persist state and schedule callback delivery with fallback compatibility mode."""
+
+        dispatcher = self._callback_outbox_dispatcher
+        if dispatcher is None or not isinstance(self._repository, CallbackOutboxRepository):
+            await self._repository.upsert(data_flow)
+            await self._notify_control_plane_immediately(
+                data_flow,
+                response,
+                callback_event_type=callback_event_type,
+            )
+            return
+
+        callback_event = ControlPlaneCallbackEvent(
+            process_id=data_flow.process_id,
+            data_flow_id=data_flow.data_flow_id,
+            event_type=callback_event_type,
+            callback_address=data_flow.callback_address,
+            payload=response,
+        )
+        await self._repository.persist_transition(data_flow, callback_event)
+        await dispatcher.notify_new_event()
+
+    async def _notify_control_plane_immediately(
+        self,
+        data_flow: DataFlow,
+        response: DataFlowResponseMessage,
+        *,
+        callback_event_type: ControlPlaneCallbackEventType,
+    ) -> None:
+        if callback_event_type is ControlPlaneCallbackEventType.PREPARED:
+            await self._control_plane_notifier.notify_prepared(data_flow, response)
+            return
+        if callback_event_type is ControlPlaneCallbackEventType.STARTED:
+            await self._control_plane_notifier.notify_started(data_flow, response)
+            return
+        if callback_event_type is ControlPlaneCallbackEventType.COMPLETED:
+            await self._control_plane_notifier.notify_completed(data_flow, response)
+            return
+        if callback_event_type is ControlPlaneCallbackEventType.ERRORED:
+            await self._control_plane_notifier.notify_terminated(data_flow, response)
+            return
+
+        raise DataFlowValidationError(
+            f"Unsupported callback event type '{callback_event_type}'."
+        )
+
     async def _reconcile_runtime_failure(self, data_flow: DataFlow) -> DataFlow:
         """Promote failed runtime sessions to TERMINATED when executor reports errors."""
 
@@ -607,9 +709,12 @@ class DataFlowService:
             return data_flow
 
         data_flow.state = DataFlowState.TERMINATED
-        await self._repository.upsert(data_flow)
         response = self._response_message(data_flow, error=error)
-        await self._control_plane_notifier.notify_terminated(data_flow, response)
+        await self._persist_transition_with_callback(
+            data_flow,
+            response,
+            callback_event_type=ControlPlaneCallbackEventType.ERRORED,
+        )
         await self._publish_state_event(data_flow)
         return data_flow
 

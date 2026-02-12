@@ -1,17 +1,20 @@
 """Application bootstrap/wiring."""
 
 import logging
+from dataclasses import dataclass
 
 from simpl_bulk_dataplane.application.services import DataFlowService
 from simpl_bulk_dataplane.config import RepositoryBackend, Settings
 from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
 from simpl_bulk_dataplane.domain.ports import (
+    CallbackOutboxRepository,
     ControlPlaneNotifier,
     DataFlowEventPublisher,
     DataFlowRepository,
 )
 from simpl_bulk_dataplane.domain.signaling_models import DataPlaneRegistrationMessage
 from simpl_bulk_dataplane.infrastructure.callbacks import (
+    ControlPlaneCallbackOutboxDispatcher,
     HttpControlPlaneNotifier,
     NoopControlPlaneNotifier,
 )
@@ -30,6 +33,12 @@ from simpl_bulk_dataplane.infrastructure.repositories import (
 from simpl_bulk_dataplane.infrastructure.transfers import S3TransferExecutor
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class _ControlPlaneCallbackWiring:
+    notifier: ControlPlaneNotifier
+    client: ControlPlaneClient | None
 
 
 def _build_repository(settings: Settings) -> DataFlowRepository:
@@ -85,16 +94,16 @@ def _dataplane_signaling_endpoint(settings: Settings) -> str | None:
     return f"{base_url}{normalized_prefix}"
 
 
-def _build_control_plane_notifier(settings: Settings) -> ControlPlaneNotifier:
+def _build_control_plane_notifier(settings: Settings) -> _ControlPlaneCallbackWiring:
     if not settings.control_plane_registration_enabled:
-        return NoopControlPlaneNotifier()
+        return _ControlPlaneCallbackWiring(notifier=NoopControlPlaneNotifier(), client=None)
 
     if settings.control_plane_endpoint is None:
         logger.warning(
             "Control-plane registration enabled but SIMPL_DP_CONTROL_PLANE_ENDPOINT is missing. "
             "Falling back to noop callbacks."
         )
-        return NoopControlPlaneNotifier()
+        return _ControlPlaneCallbackWiring(notifier=NoopControlPlaneNotifier(), client=None)
 
     dataplane_endpoint = _dataplane_signaling_endpoint(settings)
     if dataplane_endpoint is None:
@@ -102,7 +111,7 @@ def _build_control_plane_notifier(settings: Settings) -> ControlPlaneNotifier:
             "Control-plane registration enabled but SIMPL_DP_DATAPLANE_PUBLIC_URL is missing. "
             "Falling back to noop callbacks."
         )
-        return NoopControlPlaneNotifier()
+        return _ControlPlaneCallbackWiring(notifier=NoopControlPlaneNotifier(), client=None)
 
     registration = DataPlaneRegistrationMessage(
         dataplane_id=settings.dataplane_id,
@@ -127,19 +136,38 @@ def _build_control_plane_notifier(settings: Settings) -> ControlPlaneNotifier:
             settings.control_plane_endpoint,
             exc,
         )
-        return NoopControlPlaneNotifier()
+        return _ControlPlaneCallbackWiring(notifier=NoopControlPlaneNotifier(), client=None)
 
     logger.info(
         "Registered dataplane '%s' at control plane '%s'.",
         settings.dataplane_id,
         settings.control_plane_endpoint,
     )
-    return HttpControlPlaneNotifier(client)
+    return _ControlPlaneCallbackWiring(
+        notifier=HttpControlPlaneNotifier(client),
+        client=client,
+    )
+
+
+def _build_callback_outbox_dispatcher(
+    repository: DataFlowRepository,
+    control_plane_client: ControlPlaneClient | None,
+) -> ControlPlaneCallbackOutboxDispatcher | None:
+    if control_plane_client is None:
+        return None
+    if not isinstance(repository, CallbackOutboxRepository):
+        return None
+    return ControlPlaneCallbackOutboxDispatcher(
+        outbox_repository=repository,
+        control_plane_client=control_plane_client,
+    )
 
 
 def build_dataflow_service(settings: Settings) -> DataFlowService:
     """Compose service graph."""
 
+    repository = _build_repository(settings)
+    control_plane_wiring = _build_control_plane_notifier(settings)
     event_publisher = _build_dataflow_event_publisher(settings)
 
     async def progress_callback(
@@ -151,9 +179,14 @@ def build_dataflow_service(settings: Settings) -> DataFlowService:
             progress=progress,
         )
 
+    callback_outbox_dispatcher = _build_callback_outbox_dispatcher(
+        repository=repository,
+        control_plane_client=control_plane_wiring.client,
+    )
+
     return DataFlowService(
         dataplane_id=settings.dataplane_id,
-        repository=_build_repository(settings),
+        repository=repository,
         transfer_executor=S3TransferExecutor(
             default_region=settings.aws_region,
             multipart_threshold_mb=settings.s3_multipart_threshold_mb,
@@ -164,8 +197,9 @@ def build_dataflow_service(settings: Settings) -> DataFlowService:
             prefer_server_side_copy=settings.s3_prefer_server_side_copy,
             progress_callback=progress_callback,
         ),
-        control_plane_notifier=_build_control_plane_notifier(settings),
+        control_plane_notifier=control_plane_wiring.notifier,
         dataflow_event_publisher=event_publisher,
+        callback_outbox_dispatcher=callback_outbox_dispatcher,
     )
 
 

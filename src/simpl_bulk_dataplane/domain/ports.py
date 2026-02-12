@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from datetime import datetime
+from typing import Protocol, runtime_checkable
 
+from simpl_bulk_dataplane.domain.callbacks import (
+    ControlPlaneCallbackEvent,
+    PendingControlPlaneCallbackEvent,
+)
 from simpl_bulk_dataplane.domain.entities import DataFlow
 from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
 from simpl_bulk_dataplane.domain.signaling_models import (
@@ -29,6 +34,38 @@ class DataFlowRepository(Protocol):
 
     async def upsert(self, data_flow: DataFlow) -> None:
         """Create or update a data flow."""
+
+    async def persist_transition(
+        self,
+        data_flow: DataFlow,
+        callback_event: ControlPlaneCallbackEvent | None = None,
+    ) -> None:
+        """Persist state transition and optional callback event atomically."""
+
+
+@runtime_checkable
+class CallbackOutboxRepository(Protocol):
+    """Durable callback outbox port used by dispatcher workers."""
+
+    async def claim_due_callback_events(
+        self,
+        *,
+        limit: int,
+        lease_seconds: float,
+    ) -> list[PendingControlPlaneCallbackEvent]:
+        """Claim due callback events for delivery and apply a processing lease."""
+
+    async def mark_callback_event_sent(self, outbox_id: int) -> None:
+        """Mark callback event as delivered successfully."""
+
+    async def mark_callback_event_failed(
+        self,
+        outbox_id: int,
+        *,
+        error: str,
+        next_attempt_at: datetime,
+    ) -> None:
+        """Record callback delivery failure and schedule next retry."""
 
 
 class TransferExecutor(Protocol):
@@ -100,6 +137,7 @@ class DataFlowEventPublisher(Protocol):
 
 
 __all__ = [
+    "CallbackOutboxRepository",
     "ControlPlaneNotifier",
     "DataFlowEventPublisher",
     "DataFlowRepository",

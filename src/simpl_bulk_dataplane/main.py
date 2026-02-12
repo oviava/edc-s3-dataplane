@@ -18,8 +18,12 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         """Build singleton dependencies at startup."""
 
-        get_dataflow_service()
-        yield
+        service = get_dataflow_service()
+        await service.startup()
+        try:
+            yield
+        finally:
+            await service.shutdown()
 
     settings = get_settings()
     app = FastAPI(

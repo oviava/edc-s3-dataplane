@@ -1,6 +1,7 @@
 """Infrastructure layer public API."""
 
 from simpl_bulk_dataplane.infrastructure.callbacks import (
+    ControlPlaneCallbackOutboxDispatcher,
     HttpControlPlaneNotifier,
     NoopControlPlaneNotifier,
 )
@@ -21,6 +22,7 @@ from simpl_bulk_dataplane.infrastructure.transfers import S3TransferExecutor
 __all__ = [
     "ControlPlaneClient",
     "ControlPlaneClientError",
+    "ControlPlaneCallbackOutboxDispatcher",
     "HttpControlPlaneNotifier",
     "InMemoryDataFlowRepository",
     "MqttDataFlowEventPublisher",

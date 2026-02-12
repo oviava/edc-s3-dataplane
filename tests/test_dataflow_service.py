@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 import pytest
 
 from simpl_bulk_dataplane.application.services import DataFlowService
+from simpl_bulk_dataplane.domain.callbacks import ControlPlaneCallbackEventType
 from simpl_bulk_dataplane.domain.entities import DataFlow
 from simpl_bulk_dataplane.domain.errors import DataFlowConflictError, DataFlowValidationError
 from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
@@ -13,6 +14,7 @@ from simpl_bulk_dataplane.domain.ports import TransferExecutor
 from simpl_bulk_dataplane.domain.signaling_models import (
     DataAddress,
     DataFlowPrepareMessage,
+    DataFlowResponseMessage,
     DataFlowResumeMessage,
     DataFlowStartedNotificationMessage,
     DataFlowStartMessage,
@@ -183,6 +185,48 @@ class CompletionAwareTransferExecutor(RecordingTransferExecutor):
         await callback(data_flow_id)
 
 
+class RecordingOutboxDispatcher:
+    """Test double for callback outbox wake-ups and lifecycle hooks."""
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.stopped = 0
+        self.notified = 0
+
+    async def start(self) -> None:
+        self.started += 1
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    async def notify_new_event(self) -> None:
+        self.notified += 1
+
+
+class FailingNotifier(NoopControlPlaneNotifier):
+    """Guard that fails tests if fallback immediate callbacks are used."""
+
+    async def notify_prepared(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
+        _ = (data_flow, message)
+        raise AssertionError("Direct prepared callback should not be used.")
+
+    async def notify_started(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
+        _ = (data_flow, message)
+        raise AssertionError("Direct started callback should not be used.")
+
+    async def notify_completed(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
+        _ = (data_flow, message)
+        raise AssertionError("Direct completed callback should not be used.")
+
+    async def notify_terminated(
+        self,
+        data_flow: DataFlow,
+        message: DataFlowResponseMessage,
+    ) -> None:
+        _ = (data_flow, message)
+        raise AssertionError("Direct terminated callback should not be used.")
+
+
 def test_resume_can_restart_push_without_repeating_data_address() -> None:
     transfer_executor = RecordingTransferExecutor()
     service = DataFlowService(
@@ -228,6 +272,28 @@ def test_resume_can_restart_push_without_repeating_data_address() -> None:
     assert len(transfer_executor.start_messages) == 2
     assert transfer_executor.start_messages[1].data_address is not None
     assert transfer_executor.start_messages[1].data_address.endpoint == "s3://dst-bucket/result.csv"
+
+
+def test_start_with_outbox_dispatcher_enqueues_callback_instead_of_direct_notify() -> None:
+    repository = InMemoryDataFlowRepository()
+    dispatcher = RecordingOutboxDispatcher()
+    service = DataFlowService(
+        dataplane_id="dataplane-test",
+        repository=repository,
+        transfer_executor=RecordingTransferExecutor(),
+        control_plane_notifier=FailingNotifier(),
+        dataflow_event_publisher=NoopDataFlowEventPublisher(),
+        callback_outbox_dispatcher=dispatcher,
+    )
+
+    result = asyncio.run(service.start(start_message("proc-outbox-start")))
+    assert result.body is not None
+    assert dispatcher.notified == 1
+
+    events = asyncio.run(repository.claim_due_callback_events(limit=10, lease_seconds=1))
+    assert len(events) == 1
+    assert events[0].event_type is ControlPlaneCallbackEventType.STARTED
+    assert events[0].process_id == "proc-outbox-start"
 
 
 def test_resume_pull_after_started_notification_uses_notify_started() -> None:
