@@ -154,17 +154,12 @@ async def get_data_flow_status(
         _raise_http_exception(exc)
 
 
-@router.get("/dataflows/{id}/completed", status_code=200)
-@router.post("/dataflows/{id}/completed", status_code=200, include_in_schema=False)
+@router.post("/dataflows/{id}/completed", status_code=200)
 async def notify_completed(
     id: str = Path(...),
     service: DataFlowService = Depends(get_dataflow_service),
 ) -> Response:
-    """Mark data transmission as completed.
-
-    OpenAPI currently declares GET while narrative docs describe POST. The
-    scaffold accepts both to avoid protocol drift during integration.
-    """
+    """Mark data transmission as completed."""
 
     try:
         await service.completed(id)

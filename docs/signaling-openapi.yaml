@@ -267,7 +267,7 @@ paths:
           description: Not Found - data flow with specified ID does not exist
 
   /dataflows/{id}/completed:
-    get:
+    post:
       tags:
         - Data plane endpoints
       summary: Notify the data plane of a completed transfer
