@@ -158,6 +158,34 @@ SIMPL_MANUAL_MQTT_PASSWORD=guest
 Manual UI live stream endpoint:
 - `GET /ws/dataflows?dataplaneUrls=http://dp-a:8080,http://dp-b:8080` (WebSocket)
 
+## Control-plane registration and callbacks
+
+Dataplane can register itself on startup and then send state callbacks to control-plane endpoints from `docs/signaling-openapi.yaml`:
+- `POST /transfers/{transferId}/dataflow/prepared`
+- `POST /transfers/{transferId}/dataflow/started`
+- `POST /transfers/{transferId}/dataflow/completed`
+- `POST /transfers/{transferId}/dataflow/errored`
+
+Enable startup registration:
+
+```bash
+SIMPL_DP_CONTROL_PLANE_REGISTRATION_ENABLED=true
+SIMPL_DP_CONTROL_PLANE_ENDPOINT=https://controlplane.example.com/signaling/v1
+SIMPL_DP_DATAPLANE_PUBLIC_URL=https://dataplane.example.com/signaling/v1
+# optional
+SIMPL_DP_CONTROL_PLANE_TIMEOUT_SECONDS=10
+SIMPL_DP_CONTROL_PLANE_REGISTRATION_NAME=My Dataplane
+SIMPL_DP_CONTROL_PLANE_REGISTRATION_DESCRIPTION=Dataplane for team X
+SIMPL_DP_CONTROL_PLANE_REGISTRATION_TRANSFER_TYPES=com.test.s3-PUSH,com.test.s3-PULL
+SIMPL_DP_CONTROL_PLANE_REGISTRATION_LABELS=team-x,prod
+SIMPL_DP_CONTROL_PLANE_REGISTRATION_AUTHORIZATION=[{"type":"oauth2_client_credentials"}]
+```
+
+Behavior:
+- On startup, dataplane tries `POST /dataplanes/register` on the configured control plane.
+- If registration succeeds, HTTP callbacks are enabled.
+- If registration fails (or config is incomplete), dataplane falls back to noop callbacks.
+
 ## Notes
 
 - Endpoints are scaffolded from `docs/signaling-openapi.yaml`.

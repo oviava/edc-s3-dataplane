@@ -1,10 +1,24 @@
 """Application bootstrap/wiring."""
 
+import logging
+
 from simpl_bulk_dataplane.application.services import DataFlowService
 from simpl_bulk_dataplane.config import RepositoryBackend, Settings
 from simpl_bulk_dataplane.domain.monitoring_models import TransferProgressSnapshot
-from simpl_bulk_dataplane.domain.ports import DataFlowEventPublisher, DataFlowRepository
-from simpl_bulk_dataplane.infrastructure.callbacks import NoopControlPlaneNotifier
+from simpl_bulk_dataplane.domain.ports import (
+    ControlPlaneNotifier,
+    DataFlowEventPublisher,
+    DataFlowRepository,
+)
+from simpl_bulk_dataplane.domain.signaling_models import DataPlaneRegistrationMessage
+from simpl_bulk_dataplane.infrastructure.callbacks import (
+    HttpControlPlaneNotifier,
+    NoopControlPlaneNotifier,
+)
+from simpl_bulk_dataplane.infrastructure.control_plane import (
+    ControlPlaneClient,
+    ControlPlaneClientError,
+)
 from simpl_bulk_dataplane.infrastructure.events import (
     MqttDataFlowEventPublisher,
     NoopDataFlowEventPublisher,
@@ -14,6 +28,8 @@ from simpl_bulk_dataplane.infrastructure.repositories import (
     PostgresDataFlowRepository,
 )
 from simpl_bulk_dataplane.infrastructure.transfers import S3TransferExecutor
+
+logger = logging.getLogger(__name__)
 
 
 def _build_repository(settings: Settings) -> DataFlowRepository:
@@ -50,6 +66,77 @@ def _build_dataflow_event_publisher(settings: Settings) -> DataFlowEventPublishe
     return NoopDataFlowEventPublisher()
 
 
+def _dataplane_signaling_endpoint(settings: Settings) -> str | None:
+    """Build externally reachable signaling endpoint from settings."""
+
+    if settings.dataplane_public_url is None:
+        return None
+
+    base_url = settings.dataplane_public_url.strip().rstrip("/")
+    if not base_url:
+        return None
+
+    api_prefix = settings.api_prefix.strip()
+    if not api_prefix:
+        return base_url
+
+    normalized_prefix = api_prefix if api_prefix.startswith("/") else f"/{api_prefix}"
+    normalized_prefix = normalized_prefix.rstrip("/")
+    return f"{base_url}{normalized_prefix}"
+
+
+def _build_control_plane_notifier(settings: Settings) -> ControlPlaneNotifier:
+    if not settings.control_plane_registration_enabled:
+        return NoopControlPlaneNotifier()
+
+    if settings.control_plane_endpoint is None:
+        logger.warning(
+            "Control-plane registration enabled but SIMPL_DP_CONTROL_PLANE_ENDPOINT is missing. "
+            "Falling back to noop callbacks."
+        )
+        return NoopControlPlaneNotifier()
+
+    dataplane_endpoint = _dataplane_signaling_endpoint(settings)
+    if dataplane_endpoint is None:
+        logger.warning(
+            "Control-plane registration enabled but SIMPL_DP_DATAPLANE_PUBLIC_URL is missing. "
+            "Falling back to noop callbacks."
+        )
+        return NoopControlPlaneNotifier()
+
+    registration = DataPlaneRegistrationMessage(
+        dataplane_id=settings.dataplane_id,
+        name=settings.control_plane_registration_name or settings.app_name,
+        description=settings.control_plane_registration_description,
+        endpoint=dataplane_endpoint,
+        transfer_types=settings.control_plane_registration_transfer_types,
+        authorization=settings.control_plane_registration_authorization,
+        labels=settings.control_plane_registration_labels,
+    )
+    try:
+        client = ControlPlaneClient(
+            base_url=settings.control_plane_endpoint,
+            timeout_seconds=settings.control_plane_timeout_seconds,
+        )
+        client.register_dataplane(registration)
+    except ControlPlaneClientError as exc:
+        logger.warning(
+            "Failed to register dataplane '%s' at control plane '%s': %s. "
+            "Falling back to noop callbacks.",
+            settings.dataplane_id,
+            settings.control_plane_endpoint,
+            exc,
+        )
+        return NoopControlPlaneNotifier()
+
+    logger.info(
+        "Registered dataplane '%s' at control plane '%s'.",
+        settings.dataplane_id,
+        settings.control_plane_endpoint,
+    )
+    return HttpControlPlaneNotifier(client)
+
+
 def build_dataflow_service(settings: Settings) -> DataFlowService:
     """Compose service graph."""
 
@@ -74,7 +161,7 @@ def build_dataflow_service(settings: Settings) -> DataFlowService:
             multipart_concurrency=settings.s3_multipart_concurrency,
             progress_callback=progress_callback,
         ),
-        control_plane_notifier=NoopControlPlaneNotifier(),
+        control_plane_notifier=_build_control_plane_notifier(settings),
         dataflow_event_publisher=event_publisher,
     )
 

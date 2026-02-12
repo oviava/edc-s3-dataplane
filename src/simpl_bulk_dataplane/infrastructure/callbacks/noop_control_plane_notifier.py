@@ -6,7 +6,7 @@ from simpl_bulk_dataplane.domain.signaling_models import DataFlowResponseMessage
 
 
 class NoopControlPlaneNotifier(ControlPlaneNotifier):
-    """Placeholder callback adapter until HTTP callbacks are implemented."""
+    """Fallback callback adapter when control-plane callbacks are unavailable."""
 
     async def notify_prepared(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
         _ = (data_flow, message)

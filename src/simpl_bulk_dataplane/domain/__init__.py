@@ -29,6 +29,7 @@ from simpl_bulk_dataplane.domain.signaling_models import (
     DataFlowStatusResponseMessage,
     DataFlowSuspendMessage,
     DataFlowTerminateMessage,
+    DataPlaneRegistrationMessage,
     EndpointProperty,
 )
 from simpl_bulk_dataplane.domain.transfer_types import DataFlowState, TransferMode
@@ -44,6 +45,7 @@ __all__ = [
     "DataFlowListResponse",
     "DataFlowProgressResponse",
     "DataFlowNotFoundError",
+    "DataPlaneRegistrationMessage",
     "DataFlowPrepareMessage",
     "DataFlowRepository",
     "DataFlowResponseMessage",

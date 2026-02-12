@@ -1,8 +1,9 @@
 """Application settings."""
 
 from enum import StrEnum
+from typing import Any
 
-from pydantic import model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +38,31 @@ class Settings(BaseSettings):
     dataflow_events_mqtt_password: str | None = None
     dataflow_events_mqtt_topic_prefix: str = "simpl/dataplane"
     dataflow_events_mqtt_qos: int = 0
+    control_plane_registration_enabled: bool = False
+    control_plane_endpoint: str | None = None
+    control_plane_timeout_seconds: float = 10.0
+    control_plane_registration_name: str | None = None
+    control_plane_registration_description: str | None = None
+    control_plane_registration_transfer_types: list[str] = Field(
+        default_factory=lambda: ["com.test.s3-PUSH", "com.test.s3-PULL"]
+    )
+    control_plane_registration_labels: list[str] = Field(default_factory=list)
+    control_plane_registration_authorization: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+
+    @field_validator(
+        "control_plane_registration_transfer_types",
+        "control_plane_registration_labels",
+        mode="before",
+    )
+    @classmethod
+    def parse_csv_list(cls, value: object) -> object:
+        """Support comma-separated env var values in addition to JSON arrays."""
+
+        if not isinstance(value, str):
+            return value
+        return [item.strip() for item in value.split(",") if item.strip()]
 
     @model_validator(mode="after")
     def validate_repository_settings(self) -> "Settings":
@@ -61,6 +87,8 @@ class Settings(BaseSettings):
             raise ValueError("SIMPL_DP_DATAFLOW_EVENTS_MQTT_PORT must be >= 1.")
         if self.dataflow_events_mqtt_qos not in {0, 1, 2}:
             raise ValueError("SIMPL_DP_DATAFLOW_EVENTS_MQTT_QOS must be one of 0, 1, 2.")
+        if self.control_plane_timeout_seconds <= 0:
+            raise ValueError("SIMPL_DP_CONTROL_PLANE_TIMEOUT_SECONDS must be > 0.")
         return self
 
     model_config = SettingsConfigDict(env_prefix="SIMPL_DP_", extra="ignore")

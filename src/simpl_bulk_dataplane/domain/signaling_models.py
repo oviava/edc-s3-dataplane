@@ -105,8 +105,21 @@ class DataFlowStatusResponseMessage(SignalingModel):
     state: DataFlowState
 
 
+class DataPlaneRegistrationMessage(SignalingModel):
+    """Data plane registration payload sent to control plane."""
+
+    dataplane_id: str = Field(alias="dataplaneId")
+    name: str
+    description: str | None = None
+    endpoint: str
+    transfer_types: list[str] = Field(alias="transferTypes")
+    authorization: list[dict[str, Any]] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+
+
 __all__ = [
     "DataAddress",
+    "DataPlaneRegistrationMessage",
     "DataFlowBaseMessage",
     "DataFlowPrepareMessage",
     "DataFlowResponseMessage",
