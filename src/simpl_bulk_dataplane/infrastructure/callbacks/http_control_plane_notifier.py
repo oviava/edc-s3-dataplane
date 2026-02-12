@@ -13,18 +13,41 @@ class HttpControlPlaneNotifier(ControlPlaneNotifier):
         self._client = client
 
     async def notify_prepared(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
-        await self._client.signal_prepared(data_flow.process_id, message)
+        await self._client.signal_prepared(
+            data_flow.process_id,
+            message,
+            callback_base_url=self._callback_base_url(data_flow),
+        )
 
     async def notify_started(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
-        await self._client.signal_started(data_flow.process_id, message)
+        await self._client.signal_started(
+            data_flow.process_id,
+            message,
+            callback_base_url=self._callback_base_url(data_flow),
+        )
 
     async def notify_completed(self, data_flow: DataFlow, message: DataFlowResponseMessage) -> None:
-        await self._client.signal_completed(data_flow.process_id, message)
+        await self._client.signal_completed(
+            data_flow.process_id,
+            message,
+            callback_base_url=self._callback_base_url(data_flow),
+        )
 
     async def notify_terminated(
         self, data_flow: DataFlow, message: DataFlowResponseMessage
     ) -> None:
-        await self._client.signal_errored(data_flow.process_id, message)
+        await self._client.signal_errored(
+            data_flow.process_id,
+            message,
+            callback_base_url=self._callback_base_url(data_flow),
+        )
+
+    def _callback_base_url(self, data_flow: DataFlow) -> str | None:
+        callback_address = data_flow.callback_address
+        if callback_address is None:
+            return None
+        normalized = callback_address.strip()
+        return normalized or None
 
 
 __all__ = ["HttpControlPlaneNotifier"]

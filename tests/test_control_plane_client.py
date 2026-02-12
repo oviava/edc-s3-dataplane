@@ -101,3 +101,67 @@ def test_register_dataplane_raises_descriptive_error_for_non_success_status() ->
                 transfer_types=["com.test.s3-PUSH"],
             )
         )
+
+
+def test_signal_methods_use_callback_base_url_override() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code=200)
+
+    client = ControlPlaneClient(
+        base_url="https://controlplane.example.com/signaling/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    message = DataFlowResponseMessage(
+        dataplane_id="dataplane-local",
+        data_flow_id="flow-1",
+        state=DataFlowState.STARTED,
+    )
+
+    asyncio.run(
+        client.signal_started(
+            "transfer-123",
+            message,
+            callback_base_url="https://callbacks.example.com/custom",
+        )
+    )
+
+    assert len(requests) == 1
+    assert (
+        str(requests[0].url)
+        == "https://callbacks.example.com/custom/transfers/transfer-123/dataflow/started"
+    )
+
+
+def test_signal_methods_fall_back_to_default_base_url_when_callback_override_is_blank() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code=200)
+
+    client = ControlPlaneClient(
+        base_url="https://controlplane.example.com/signaling/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    message = DataFlowResponseMessage(
+        dataplane_id="dataplane-local",
+        data_flow_id="flow-1",
+        state=DataFlowState.STARTED,
+    )
+
+    asyncio.run(
+        client.signal_started(
+            "transfer-123",
+            message,
+            callback_base_url="  ",
+        )
+    )
+
+    assert len(requests) == 1
+    assert (
+        str(requests[0].url)
+        == "https://controlplane.example.com/signaling/v1/transfers/transfer-123/dataflow/started"
+    )

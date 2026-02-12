@@ -48,34 +48,78 @@ class ControlPlaneClient:
             raise ControlPlaneClientError(f"POST {url} failed: {exc}") from exc
         self._ensure_success(response)
 
-    async def signal_prepared(self, transfer_id: str, message: DataFlowResponseMessage) -> None:
+    async def signal_prepared(
+        self,
+        transfer_id: str,
+        message: DataFlowResponseMessage,
+        callback_base_url: str | None = None,
+    ) -> None:
         """Call `/transfers/{transferId}/dataflow/prepared`."""
 
-        await self._signal_dataflow_state(transfer_id, "prepared", message)
+        await self._signal_dataflow_state(
+            transfer_id,
+            "prepared",
+            message,
+            callback_base_url=callback_base_url,
+        )
 
-    async def signal_started(self, transfer_id: str, message: DataFlowResponseMessage) -> None:
+    async def signal_started(
+        self,
+        transfer_id: str,
+        message: DataFlowResponseMessage,
+        callback_base_url: str | None = None,
+    ) -> None:
         """Call `/transfers/{transferId}/dataflow/started`."""
 
-        await self._signal_dataflow_state(transfer_id, "started", message)
+        await self._signal_dataflow_state(
+            transfer_id,
+            "started",
+            message,
+            callback_base_url=callback_base_url,
+        )
 
-    async def signal_completed(self, transfer_id: str, message: DataFlowResponseMessage) -> None:
+    async def signal_completed(
+        self,
+        transfer_id: str,
+        message: DataFlowResponseMessage,
+        callback_base_url: str | None = None,
+    ) -> None:
         """Call `/transfers/{transferId}/dataflow/completed`."""
 
-        await self._signal_dataflow_state(transfer_id, "completed", message)
+        await self._signal_dataflow_state(
+            transfer_id,
+            "completed",
+            message,
+            callback_base_url=callback_base_url,
+        )
 
-    async def signal_errored(self, transfer_id: str, message: DataFlowResponseMessage) -> None:
+    async def signal_errored(
+        self,
+        transfer_id: str,
+        message: DataFlowResponseMessage,
+        callback_base_url: str | None = None,
+    ) -> None:
         """Call `/transfers/{transferId}/dataflow/errored`."""
 
-        await self._signal_dataflow_state(transfer_id, "errored", message)
+        await self._signal_dataflow_state(
+            transfer_id,
+            "errored",
+            message,
+            callback_base_url=callback_base_url,
+        )
 
     async def _signal_dataflow_state(
         self,
         transfer_id: str,
         state_path: str,
         message: DataFlowResponseMessage,
+        callback_base_url: str | None = None,
     ) -> None:
         transfer_id_path = quote(transfer_id, safe="")
-        url = self._endpoint(f"/transfers/{transfer_id_path}/dataflow/{state_path}")
+        url = self._endpoint(
+            f"/transfers/{transfer_id_path}/dataflow/{state_path}",
+            base_url=callback_base_url,
+        )
         async_transport = cast(httpx.AsyncBaseTransport | None, self._transport)
         try:
             async with httpx.AsyncClient(
@@ -90,8 +134,8 @@ class ControlPlaneClient:
             raise ControlPlaneClientError(f"POST {url} failed: {exc}") from exc
         self._ensure_success(response)
 
-    def _endpoint(self, path: str) -> str:
-        return f"{self._base_url}{path}"
+    def _endpoint(self, path: str, base_url: str | None = None) -> str:
+        return f"{self._resolve_base_url(base_url)}{path}"
 
     def _ensure_success(self, response: httpx.Response) -> None:
         if response.is_success:
@@ -120,6 +164,16 @@ class ControlPlaneClient:
         if not normalized:
             raise ControlPlaneClientError("Control plane endpoint cannot be empty.")
         return normalized
+
+    def _resolve_base_url(self, base_url: str | None) -> str:
+        if base_url is None:
+            return self._base_url
+
+        normalized = base_url.strip()
+        if not normalized:
+            return self._base_url
+
+        return self._normalize_base_url(normalized)
 
 
 __all__ = ["ControlPlaneClient", "ControlPlaneClientError"]
